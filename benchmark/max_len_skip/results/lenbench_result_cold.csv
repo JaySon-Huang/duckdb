@@ -1,0 +1,21 @@
+query|mode|median_time|row_groups|result
+max_strlen_concentrated|baseline|300ms|Row Groups Scanned: 4070 / 4070|1000
+max_strlen_concentrated|optimized|138ms|Row Groups Scanned: 0 (fully precomputed)|1000
+min_strlen_concentrated|baseline|318ms|Row Groups Scanned: 4070 / 4070|10
+min_strlen_concentrated|optimized|155ms|Row Groups Scanned: 0 (fully precomputed)|10
+max_charlen_concentrated|baseline|312ms|Row Groups Scanned: 4070 / 4070|1000
+max_charlen_concentrated|optimized|124ms|Row Groups Scanned: 0 (fully precomputed)|1000
+min_charlen_concentrated|baseline|304ms|Row Groups Scanned: 4070 / 4070|10
+min_charlen_concentrated|optimized|128ms|Row Groups Scanned: 0 (fully precomputed)|10
+max_charlen_unicode|baseline|338ms|Row Groups Scanned: 4070 / 4070|50
+max_charlen_unicode|optimized|167ms|Row Groups Scanned: 408 / 4070|50
+min_charlen_unicode|baseline|290ms|Row Groups Scanned: 4070 / 4070|10
+min_charlen_unicode|optimized|161ms|Row Groups Scanned: 1 / 4070|10
+max_charlen_unicode_all|baseline|297ms|Row Groups Scanned: 4070 / 4070|50
+max_charlen_unicode_all|optimized|316ms|Row Groups Scanned: 4070 / 4070|50
+multi_charlen|baseline|441ms|Row Groups Scanned: 814 / 814|1000,1000,1000,1000,1000,1000,1000,1000
+multi_charlen|optimized|146ms|Row Groups Scanned: 0 (fully precomputed)|1000,1000,1000,1000,1000,1000,1000,1000
+sum_i|baseline|178ms|Row Groups Scanned: 4070 / 4070|124999999750000000
+sum_i|optimized|174ms|Row Groups Scanned: 4070 / 4070|124999999750000000
+count_star|baseline|138ms|Row Groups Scanned: 4070 / 4070|500000000
+count_star|optimized|105ms|Row Groups Scanned: 0 (fully precomputed)|500000000
