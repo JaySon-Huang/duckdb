@@ -174,6 +174,64 @@ bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) 
 	return false;
 }
 
+//! Whether the function returns the byte length of its input (strlen/octet_length)
+bool IsByteLengthFunction(const Identifier &fun_name) {
+	return fun_name == "strlen" || fun_name == "octet_length";
+}
+
+//! Try to resolve the column referenced by a byte-length function expression, e.g. strlen(col)
+bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &fun = expr.Cast<BoundFunctionExpression>();
+	if (!IsByteLengthFunction(fun.Function().GetName())) {
+		return false;
+	}
+	if (fun.GetChildren().size() != 1 ||
+	    fun.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	binding = fun.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+	return true;
+}
+
+//! Extract the exact byte length of a partition from its string statistics
+bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
+                                Value &result) {
+	if (!stats.partition_row_group) {
+		return false;
+	}
+	auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
+	if (!column_stats) {
+		return false;
+	}
+	if (!stats.partition_row_group->MinMaxIsExact(storage_index) || stats.partition_row_group->HasPendingWrites()) {
+		return false;
+	}
+	if (column_stats->GetStatsType() != StatisticsType::STRING_STATS) {
+		// no length statistics available for this type
+		return false;
+	}
+	if (!column_stats->CanHaveNoNull()) {
+		// the partition might be entirely NULL - MIN/MAX would return NULL, so we cannot extract a value
+		return false;
+	}
+	if (is_min) {
+		auto min_length = StringStats::MinStringLength(*column_stats);
+		if (!min_length.IsValid()) {
+			return false;
+		}
+		result = Value::BIGINT(NumericCast<int64_t>(min_length.GetIndex()));
+	} else {
+		if (!StringStats::HasMaxStringLength(*column_stats)) {
+			return false;
+		}
+		result = Value::BIGINT(NumericCast<int64_t>(StringStats::MaxStringLength(*column_stats)));
+	}
+	return true;
+}
+
 } // namespace
 
 void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_ptr<LogicalOperator> &node_ptr) {
@@ -185,6 +243,19 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	vector<idx_t> count_star_idxs;
 	vector<MinMaxColumnInfo> min_max_columns;
 	vector<unique_ptr<ValueComparator>> comparators;
+	//! positions of the min/max aggregates in aggr.expressions
+	vector<idx_t> min_max_aggr_idxs;
+	//! whether the min/max aggregates are MIN, parallel to min_max_columns
+	vector<bool> min_max_is_min;
+	//! byte-length aggregates (MIN/MAX of strlen/octet_length), parallel to length_is_min
+	struct LengthColumnInfo {
+		ColumnBinding binding;
+		LogicalType result_type;
+		bool is_min;
+		idx_t aggr_idx;
+	};
+	vector<LengthColumnInfo> length_columns;
+	vector<bool> length_is_min;
 
 	for (idx_t i = 0; i < aggr.expressions.size(); i++) {
 		auto &aggr_ref = aggr.expressions[i];
@@ -203,12 +274,20 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 		auto &fun_name = aggr_expr.Function().GetName();
 		if (fun_name == "min" || fun_name == "max") {
+			const bool is_min = fun_name == "min";
 			if (aggr_expr.GetChildren().size() != 1) {
 				return;
 			}
 			MinMaxColumnInfo column_info;
 			if (!TryGetMinMaxColumnInfo(*aggr_expr.GetChildren()[0], column_info)) {
-				return;
+				// min/max over a byte-length function, e.g. MAX(strlen(col))
+				ColumnBinding length_binding;
+				if (!TryGetLengthColumnRef(*aggr_expr.GetChildren()[0], length_binding)) {
+					return;
+				}
+				length_columns.push_back({length_binding, aggr_expr.GetReturnType(), is_min, i});
+				length_is_min.push_back(is_min);
+				continue;
 			}
 			min_max_columns.push_back(column_info);
 			auto comparator = GetComparator(fun_name, column_info.input_type);
@@ -217,6 +296,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				return;
 			}
 			comparators.push_back(std::move(comparator));
+			min_max_aggr_idxs.push_back(i);
+			min_max_is_min.push_back(is_min);
 		} else if (fun_name == "count_star") {
 			count_star_idxs.push_back(i);
 		} else {
@@ -228,8 +309,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	// skip any projections
 	reference<LogicalOperator> child_ref = *aggr.children[0];
 	while (child_ref.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = child_ref.get().Cast<LogicalProjection>();
 		for (auto &column_info : min_max_columns) {
-			auto &proj = child_ref.get().Cast<LogicalProjection>();
 			auto &expr = proj.GetExpression(column_info.binding);
 			MinMaxColumnInfo projection_info;
 			if (!TryGetMinMaxColumnInfo(expr, projection_info)) {
@@ -240,6 +321,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			}
 			column_info.binding = projection_info.binding;
 			column_info.input_type = projection_info.input_type;
+		}
+		for (auto &column_info : length_columns) {
+			auto &expr = proj.GetExpression(column_info.binding);
+			if (!TryGetLengthColumnRef(expr, column_info.binding)) {
+				return;
+			}
 		}
 		child_ref = *child_ref.get().children[0];
 	}
@@ -277,8 +364,18 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 
-	vector<LogicalType> types;
-	vector<unique_ptr<Expression>> agg_results;
+	vector<StorageIndex> length_storage_indexes(length_columns.size());
+	for (idx_t i = 0; i < length_columns.size(); i++) {
+		auto &binding = length_columns[i].binding;
+		auto &column_index = get.GetColumnIndex(binding);
+		if (!get.TryGetStorageIndex(column_index, length_storage_indexes[i])) {
+			return;
+		}
+	}
+
+	// build one constant per aggregate, in expression order
+	vector<LogicalType> types(aggr.expressions.size());
+	vector<unique_ptr<Expression>> agg_results(aggr.expressions.size());
 	bool need_to_scan = false;
 	vector<idx_t> scan_partition_indices;
 	// we can keep execute eager aggregate if all partitions could be either filtered entirely or remained entirely
@@ -373,9 +470,32 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 					agg_result = rhs;
 				}
 			}
-			types.push_back(agg_result.type());
-			auto expr = make_uniq<BoundConstantExpression>(agg_result);
-			agg_results.push_back(std::move(expr));
+			types[min_max_aggr_idxs[agg_idx]] = agg_result.type();
+			agg_results[min_max_aggr_idxs[agg_idx]] = make_uniq<BoundConstantExpression>(agg_result);
+		}
+	}
+	if (!length_columns.empty()) {
+		// Execute byte-length aggregates on partition statistics
+		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
+			const auto &storage_index = length_storage_indexes[agg_idx];
+			const bool is_min = length_columns[agg_idx].is_min;
+
+			Value agg_result;
+			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, is_min, agg_result)) {
+				return;
+			}
+			for (idx_t partition_idx = 1; partition_idx < partition_stats.size(); partition_idx++) {
+				Value rhs;
+				if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index, is_min, rhs)) {
+					return;
+				}
+				if (is_min ? rhs < agg_result : rhs > agg_result) {
+					agg_result = rhs;
+				}
+			}
+			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
+			types[aggr_idx] = agg_result.type();
+			agg_results[aggr_idx] = make_uniq<BoundConstantExpression>(agg_result);
 		}
 	}
 	if (!count_star_idxs.empty()) {
@@ -389,9 +509,9 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			count += stats.count;
 		}
 		for (const auto count_star_idx : count_star_idxs) {
-			auto count_result = make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
-			agg_results.emplace(agg_results.begin() + NumericCast<int64_t>(count_star_idx), std::move(count_result));
-			types.insert(types.begin() + NumericCast<int64_t>(count_star_idx), LogicalType::BIGINT);
+			types[count_star_idx] = LogicalType::BIGINT;
+			agg_results[count_star_idx] =
+			    make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
 		}
 	}
 
@@ -406,6 +526,13 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		// Build projection expressions that merge pre-computed values with aggregate results
 		auto proj_index = optimizer.binder.GenerateTableIndex();
 		vector<unique_ptr<Expression>> proj_expressions;
+		vector<bool> is_min(aggr.expressions.size(), false);
+		for (idx_t i = 0; i < min_max_aggr_idxs.size(); i++) {
+			is_min[min_max_aggr_idxs[i]] = min_max_is_min[i];
+		}
+		for (idx_t i = 0; i < length_columns.size(); i++) {
+			is_min[length_columns[i].aggr_idx] = length_columns[i].is_min;
+		}
 		for (idx_t i = 0; i < aggr.expressions.size(); i++) {
 			auto &aggr_expr = aggr.expressions[i]->Cast<BoundAggregateExpression>();
 			auto &fun_name = aggr_expr.Function().GetName();
@@ -420,11 +547,11 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				auto add_expr = optimizer.BindScalarFunction("+", pre_count_expr->Copy(), std::move(agg_col_ref));
 				add_expr->SetAlias(aggr.expressions[i]->GetAlias());
 				proj_expressions.push_back(std::move(add_expr));
-			} else if (fun_name == "min" || fun_name == "max") {
+			} else {
 				// For min: COALESCE(least(pre_min, agg_min), pre_min)
 				// For max: COALESCE(greatest(pre_max, agg_max), pre_max)
 				auto &pre_val_expr = agg_results[i];
-				Identifier merge_func((fun_name == "min") ? "least" : "greatest");
+				Identifier merge_func(is_min[i] ? "least" : "greatest");
 				auto merged = optimizer.BindScalarFunction(merge_func, pre_val_expr->Copy(), std::move(agg_col_ref));
 				auto coalesce =
 				    make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, aggr_expr.GetReturnType());
