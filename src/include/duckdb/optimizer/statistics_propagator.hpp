@@ -114,7 +114,7 @@ private:
 	void TryExecuteAggregates(LogicalAggregate &op, unique_ptr<LogicalOperator> &node_ptr);
 	void ReplaceWithPartialPrecompute(LogicalAggregate &aggr, LogicalGet &get,
 	                                  vector<unique_ptr<Expression>> aggr_results, vector<idx_t> scan_partition_indices,
-	                                  unique_ptr<LogicalOperator> &node_ptr);
+	                                  const vector<bool> &is_min, unique_ptr<LogicalOperator> &node_ptr);
 	void ReplaceWithFullPrecompute(LogicalAggregate &aggr, vector<unique_ptr<Expression>> aggr_results,
 	                               unique_ptr<LogicalOperator> &node_ptr);
 	void ReplaceWithEmptyResult(unique_ptr<LogicalOperator> &node);
