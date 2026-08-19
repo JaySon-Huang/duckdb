@@ -1,0 +1,179 @@
+# name: test/optimizer/max_len_skip_char.test
+# description: Test precomputation of MIN/MAX aggregates over char-length functions (length/char_length)
+# group: [optimizer]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+require no_alternative_verify
+
+# min_string_length/total_string_length are only persisted in the V2_0_0+ storage
+# format; the default v0.10.2 compatibility format drops them on checkpoint
+statement ok
+SET storage_compatibility_version='latest';
+
+statement ok
+ATTACH '{TEST_DIR}/max_len_skip_char.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+# 4 row groups: [0-2047], [2048-4095], [4096-6143], [6144-8191]
+# t_ascii: all-ASCII strings of byte length 1..100 - every row group is exact
+statement ok
+CREATE TABLE t_ascii AS (SELECT i, repeat('a', (i % 100) + 1) AS s FROM range(8192) _(i));
+
+# t_skip: row groups 0-2 are ASCII (char len 1..100), row group 3 is unicode ('你' * 20, 60 bytes).
+# The unicode row group's upper bound (60) cannot beat the exact 100, so it is skipped entirely
+statement ok
+CREATE TABLE t_skip AS (SELECT i,
+                         CASE WHEN i < 6144 THEN repeat('a', (i % 100) + 1) ELSE repeat('你', 20) END AS s
+                         FROM range(8192) _(i));
+
+# t_scan: row groups 0-2 are ASCII (char len 1..10), row group 3 is unicode ('你' * 100, 300 bytes).
+# The unicode row group's upper bound (300) can beat the exact 10, so it must be scanned
+statement ok
+CREATE TABLE t_scan AS (SELECT i,
+                         CASE WHEN i < 6144 THEN repeat('a', (i % 10) + 1) ELSE repeat('你', 100) END AS s
+                         FROM range(8192) _(i));
+
+# t_bit: BIT columns must not be treated as char-length (length(bit) is a bit count)
+statement ok
+CREATE TABLE t_bit AS (SELECT i, CAST(repeat('1', (i % 10) + 1) AS BIT) AS b FROM range(2048) _(i));
+
+# t_empty: includes empty strings (char len 0)
+statement ok
+CREATE TABLE t_empty AS (SELECT i,
+                         CASE WHEN i % 100 = 0 THEN '' ELSE repeat('a', (i % 100) + 1) END AS s
+                         FROM range(8192) _(i));
+
+# Reopen to clear row group change tracking
+statement ok
+ATTACH '{TEST_DIR}/tmp_max_len_skip_char.duckdb' AS tmp
+
+statement ok
+USE tmp
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '{TEST_DIR}/max_len_skip_char.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+statement ok
+DETACH tmp
+
+# length() over all-ASCII data is a code point count equal to the byte length: exact, zero scan
+query II
+EXPLAIN SELECT max(length(s)) FROM t_ascii
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(length(s)) FROM t_ascii
+----
+100
+
+query II
+EXPLAIN SELECT min(length(s)) FROM t_ascii
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(length(s)) FROM t_ascii
+----
+1
+
+# char_length over a mix of ASCII row groups and a unicode row group whose upper bound
+# cannot refresh the global max: the unicode row group is skipped, zero scan
+query II
+EXPLAIN SELECT max(char_length(s)) FROM t_skip
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(char_length(s)) FROM t_skip
+----
+100
+
+# MIN: the unicode row group's lower bound ceil(60 / 4) = 15 cannot beat the exact 1
+query II
+EXPLAIN SELECT min(char_length(s)) FROM t_skip
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(char_length(s)) FROM t_skip
+----
+1
+
+# char_length where the unicode row group can refresh the global max: partial precompute,
+# the unicode row group is scanned
+query II
+EXPLAIN SELECT max(char_length(s)) FROM t_scan
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(char_length(s)) FROM t_scan
+----
+100
+
+# MIN over the same table: ceil(300 / 4) = 75 cannot beat the exact 1, so the unicode
+# row group is skipped and the result is exact
+query II
+EXPLAIN SELECT min(char_length(s)) FROM t_scan
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(char_length(s)) FROM t_scan
+----
+1
+
+# mixed with a plain column max: the bounded unicode row group is scanned since the
+# partition's exact values are needed for the other aggregate
+query II
+EXPLAIN SELECT max(char_length(s)), max(i) FROM t_scan
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(char_length(s)), max(i) FROM t_scan
+----
+100	8191
+
+# length() on a BIT column is a bit count, not a code point count - not optimized
+query II
+EXPLAIN SELECT max(length(b)) FROM t_bit
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(length(b)) FROM t_bit
+----
+10
+
+# empty strings: char len 0 is exact, zero scan
+query II
+EXPLAIN SELECT min(char_length(s)) FROM t_empty
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(char_length(s)) FROM t_empty
+----
+0
+
+query II
+EXPLAIN SELECT max(char_length(s)) FROM t_empty
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(char_length(s)) FROM t_empty
+----
+100

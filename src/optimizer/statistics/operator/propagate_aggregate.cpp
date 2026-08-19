@@ -117,31 +117,51 @@ bool TryGetValueFromStats(const PartitionStatistics &stats, const StorageIndex &
 	return true;
 }
 
-//! Whether the function is a byte-length function, i.e. its result equals the byte size of the string.
-bool IsByteLengthFunction(const Identifier &fun_name) {
-	return fun_name == "strlen" || fun_name == "octet_length";
+//! The kind of length function: byte length (strlen/octet_length) or code point count (length/char_length)
+enum class LengthFunctionKind : uint8_t { NONE, BYTE_LENGTH, CHAR_LENGTH };
+
+//! Classify a function name as a length function
+LengthFunctionKind GetLengthFunctionKind(const Identifier &fun_name) {
+	if (fun_name == "strlen" || fun_name == "octet_length") {
+		return LengthFunctionKind::BYTE_LENGTH;
+	}
+	if (fun_name == "length" || fun_name == "char_length") {
+		return LengthFunctionKind::CHAR_LENGTH;
+	}
+	return LengthFunctionKind::NONE;
 }
 
 //! Try to resolve the column referenced by a LENGTH-family function expression, e.g. strlen(col)
-bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
+//! CHAR-length functions are only valid on VARCHAR input (length() also has BIT/LIST variants)
+bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding, LengthFunctionKind &kind) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
 	auto &fun = expr.Cast<BoundFunctionExpression>();
-	if (!IsByteLengthFunction(fun.Function().GetName())) {
+	kind = GetLengthFunctionKind(fun.Function().GetName());
+	if (kind == LengthFunctionKind::NONE) {
 		return false;
 	}
 	if (fun.GetChildren().size() != 1 ||
 	    fun.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
-	binding = fun.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+	auto &col_ref = fun.GetChildren()[0]->Cast<BoundColumnRefExpression>();
+	if (kind == LengthFunctionKind::CHAR_LENGTH && col_ref.GetReturnType() != LogicalType::VARCHAR) {
+		// e.g. length(bit) or length(list) - these are not code point counts over strings
+		return false;
+	}
+	binding = col_ref.Binding();
 	return true;
 }
 
-//! Extract the exact byte length of a partition from its string statistics
+//! Extract the length value of a partition from its string statistics.
+//! Byte-length functions yield an exact value; char-length functions yield an exact value when the partition
+//! is all-ASCII, and a safe bound (upper bound for MAX, lower bound for MIN) when it may contain multi-byte
+//! characters. Returns false when the partition must be scanned (inexact stats, no value).
+//! is_exact receives whether the extracted value is exact or a bound.
 bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
-                                Value &result) {
+                                bool is_char, bool &is_exact, Value &result) {
 	if (!stats.partition_row_group) {
 		return false;
 	}
@@ -159,6 +179,27 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 	if (!column_stats->CanHaveNoNull()) {
 		// the partition might be entirely NULL - MIN/MAX would return NULL, so we cannot extract a value
 		return false;
+	}
+	is_exact = true;
+	if (is_char && StringStats::CanContainUnicode(*column_stats)) {
+		// the partition may contain multi-byte characters - only a safe bound is available
+		is_exact = false;
+		if (is_min) {
+			// UTF-8 encodes each code point in at most 4 bytes: char_len >= ceil(bytes / 4)
+			auto min_length = StringStats::MinStringLength(*column_stats);
+			if (!min_length.IsValid()) {
+				return false;
+			}
+			auto min_chars = (min_length.GetIndex() + 3) / 4;
+			result = Value::BIGINT(NumericCast<int64_t>(min_chars));
+		} else {
+			// each code point takes at least one byte: char_len <= byte_len
+			if (!StringStats::HasMaxStringLength(*column_stats)) {
+				return false;
+			}
+			result = Value::BIGINT(NumericCast<int64_t>(StringStats::MaxStringLength(*column_stats)));
+		}
+		return true;
 	}
 	if (is_min) {
 		auto min_length = StringStats::MinStringLength(*column_stats);
@@ -196,9 +237,11 @@ struct PartitionAggregateRequirements {
 	//! columns that need an exact min/max, parallel to comparators
 	vector<StorageIndex> min_max_columns;
 	vector<unique_ptr<ValueComparator>> comparators;
-	//! string columns of MIN/MAX(strlen/octet_length(col)) aggregates, parallel to length_is_min
+	//! string columns of MIN/MAX(length-function(col)) aggregates, parallel to length_is_min/length_is_char
 	vector<StorageIndex> length_columns;
 	vector<bool> length_is_min;
+	//! whether the length aggregate counts code points (length/char_length) instead of bytes
+	vector<bool> length_is_char;
 	//! the query contains count(*)
 	bool needs_exact_count = false;
 };
@@ -225,6 +268,8 @@ struct AggregateValues {
 	vector<Value> min_max_values;
 	//! extracted lengths per column, parallel to requirements.length_columns
 	vector<Value> length_values;
+	//! whether each length value is exact or a safe bound, parallel to length_values
+	vector<bool> length_is_exact;
 	idx_t count = 0;
 };
 
@@ -238,6 +283,7 @@ bool TryGetPartitionAggregateInfo(LogicalAggregate &aggr, PartitionAggregateInfo
 		ColumnBinding binding;
 		bool is_min;
 		bool is_length;
+		LengthFunctionKind length_kind;
 		idx_t aggr_idx;
 		//! the input type of the aggregate (used to build the comparator for plain min/max)
 		LogicalType input_type;
@@ -263,13 +309,15 @@ bool TryGetPartitionAggregateInfo(LogicalAggregate &aggr, PartitionAggregateInfo
 				// the aggregate input may still be a length function result (e.g. lifted by common subexpression
 				// elimination, or through a view) - resolve this while tracing through the projections
 				auto &col_ref = child.Cast<BoundColumnRefExpression>();
-				candidates.push_back({col_ref.Binding(), is_min, false, i, col_ref.GetReturnType()});
+				candidates.push_back(
+				    {col_ref.Binding(), is_min, false, LengthFunctionKind::NONE, i, col_ref.GetReturnType()});
 			} else {
 				ColumnBinding length_binding;
-				if (!TryGetLengthColumnRef(child, length_binding)) {
+				LengthFunctionKind length_kind;
+				if (!TryGetLengthColumnRef(child, length_binding, length_kind)) {
 					return false;
 				}
-				candidates.push_back({length_binding, is_min, true, i, aggr_expr.GetReturnType()});
+				candidates.push_back({length_binding, is_min, true, length_kind, i, aggr_expr.GetReturnType()});
 			}
 		} else if (func_name == "count_star") {
 			info.count_star_idxs.push_back(i);
@@ -289,9 +337,11 @@ bool TryGetPartitionAggregateInfo(LogicalAggregate &aggr, PartitionAggregateInfo
 				candidate.binding = expr.Cast<BoundColumnRefExpression>().Binding();
 			} else {
 				ColumnBinding length_binding;
-				if (TryGetLengthColumnRef(expr, length_binding)) {
+				LengthFunctionKind length_kind;
+				if (TryGetLengthColumnRef(expr, length_binding, length_kind)) {
 					candidate.binding = length_binding;
 					candidate.is_length = true;
+					candidate.length_kind = length_kind;
 				} else {
 					return false;
 				}
@@ -329,6 +379,7 @@ bool TryGetPartitionAggregateInfo(LogicalAggregate &aggr, PartitionAggregateInfo
 		if (candidate.is_length) {
 			length_columns.push_back(storage_index);
 			info.requirements.length_is_min.push_back(candidate.is_min);
+			info.requirements.length_is_char.push_back(candidate.length_kind == LengthFunctionKind::CHAR_LENGTH);
 			info.length_idxs.push_back(candidate.aggr_idx);
 			info.length_types.push_back(candidate.input_type);
 		} else {
@@ -413,13 +464,18 @@ PartitionAction ClassifyPartition(ClientContext &context, const PartitionStatist
 
 	auto &length_columns = requirements.length_columns;
 	auto &length_is_min = requirements.length_is_min;
+	auto &length_is_char = requirements.length_is_char;
 	D_ASSERT(length_columns.size() == length_is_min.size());
+	D_ASSERT(length_columns.size() == length_is_char.size());
 	for (idx_t i = 0; i < length_columns.size(); ++i) {
 		Value value;
-		if (!TryGetLengthValueFromStats(stats, length_columns[i], length_is_min[i], value)) {
+		bool is_exact;
+		if (!TryGetLengthValueFromStats(stats, length_columns[i], length_is_min[i], length_is_char[i], is_exact,
+		                                value)) {
 			return PartitionAction::SCAN;
 		}
 		result.length_values.push_back(std::move(value));
+		result.length_is_exact.push_back(is_exact);
 	}
 	return PartitionAction::PRECOMPUTE;
 }
@@ -506,7 +562,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
-	// classify every partition, folding the precomputable ones as we go
+	// first pass: classify every partition and fold the exact values
 	auto &reqs = info.requirements;
 	idx_t precompute_count = 0;
 	idx_t total_count = 0;
@@ -518,38 +574,92 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	for (auto &type : info.length_types) {
 		length_values.emplace_back(type);
 	}
-	vector<idx_t> scan_partition_indices;
+	vector<PartitionAction> actions(partition_stats.size(), PartitionAction::PRUNE);
+	vector<AggregateValues> partition_values(partition_stats.size());
 
 	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
-		AggregateValues values;
-		switch (ClassifyPartition(context, partition_stats[partition_idx], reqs, values)) {
-		case PartitionAction::PRECOMPUTE:
-			precompute_count++;
-			total_count += values.count;
-			for (idx_t i = 0; i < min_max_values.size(); i++) {
-				if (min_max_values[i].IsNull() ||
-				    !reqs.comparators[i]->Compare(min_max_values[i], values.min_max_values[i])) {
-					min_max_values[i] = values.min_max_values[i];
-				}
+		auto action = ClassifyPartition(context, partition_stats[partition_idx], reqs, partition_values[partition_idx]);
+		actions[partition_idx] = action;
+		if (action != PartitionAction::PRECOMPUTE) {
+			continue;
+		}
+		// fold the exact values of this partition
+		auto &values = partition_values[partition_idx];
+		precompute_count++;
+		total_count += values.count;
+		for (idx_t i = 0; i < min_max_values.size(); i++) {
+			if (min_max_values[i].IsNull() ||
+			    !reqs.comparators[i]->Compare(min_max_values[i], values.min_max_values[i])) {
+				min_max_values[i] = values.min_max_values[i];
 			}
-			for (idx_t i = 0; i < length_values.size(); i++) {
-				auto &cur = length_values[i];
-				auto &new_val = values.length_values[i];
-				if (cur.IsNull() || (reqs.length_is_min[i] ? new_val < cur : new_val > cur)) {
-					cur = new_val;
-				}
+		}
+		for (idx_t i = 0; i < length_values.size(); i++) {
+			if (!values.length_is_exact[i]) {
+				// bounded value - decide whether to skip the partition in the second pass
+				continue;
 			}
-			break;
-		case PartitionAction::SCAN:
-			scan_partition_indices.push_back(partition_idx);
-			break;
-		case PartitionAction::PRUNE:
-			break;
+			auto &cur = length_values[i];
+			auto &new_val = values.length_values[i];
+			if (cur.IsNull() || (reqs.length_is_min[i] ? new_val < cur : new_val > cur)) {
+				cur = new_val;
+			}
 		}
 	}
 
 	if (precompute_count == 0) {
 		return;
+	}
+
+	// second pass: a partition with bounded char-length values can be skipped entirely when the bounds
+	// cannot refresh the global extreme value. This is only sound when the query has no other aggregates
+	// (plain min/max or count) that need this partition's exact values
+	const bool pure_length_query = info.min_max_idxs.empty() && info.count_star_idxs.empty();
+	vector<idx_t> scan_partition_indices;
+	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+		if (actions[partition_idx] == PartitionAction::SCAN) {
+			scan_partition_indices.push_back(partition_idx);
+			continue;
+		}
+		if (actions[partition_idx] != PartitionAction::PRECOMPUTE) {
+			continue;
+		}
+		auto &values = partition_values[partition_idx];
+		bool skip = pure_length_query;
+		bool has_bounded_value = false;
+		for (idx_t i = 0; i < values.length_values.size(); i++) {
+			if (values.length_is_exact[i]) {
+				continue;
+			}
+			has_bounded_value = true;
+			if (length_values[i].IsNull()) {
+				// no exact candidate extreme to compare against
+				skip = false;
+				break;
+			}
+			// bounded value: skip the partition if it cannot refresh the global extreme
+			if (reqs.length_is_min[i]) {
+				// min bound: the true minimum is >= the bound, so a bound that is already at least the
+				// candidate maximum cannot improve it
+				if (!(values.length_values[i] >= length_values[i])) {
+					skip = false;
+					break;
+				}
+			} else {
+				// max bound: the true maximum is <= the bound, so a bound that is already at most the
+				// candidate minimum cannot improve it
+				if (!(values.length_values[i] <= length_values[i])) {
+					skip = false;
+					break;
+				}
+			}
+		}
+		if (!has_bounded_value) {
+			// all values are exact - the partition stays precomputed
+			continue;
+		}
+		if (!skip) {
+			scan_partition_indices.push_back(partition_idx);
+		}
 	}
 	const bool need_to_scan = !scan_partition_indices.empty();
 	if (need_to_scan && !get.function.set_partitions_to_scan) {
