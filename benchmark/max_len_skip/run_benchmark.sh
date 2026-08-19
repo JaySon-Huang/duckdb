@@ -11,11 +11,15 @@
 # (SET disabled_optimizers='statistics_propagation'); there is no finer-grained
 # switch for the aggregate precomputation alone, so the baseline also disables
 # the pre-existing count/min/max precomputation.
+#
+# Set COLD=1 to drop the OS page cache (requires passwordless sudo) before
+# every duckdb invocation, measuring cold reads from disk instead of the cache.
 
 set -euo pipefail
 
 DB_PATH=${1:?usage: run_benchmark.sh <db_path> [runs]}
 RUNS=${2:-3}
+COLD=${COLD:-0}
 DUCKDB=${DUCKDB:-build/reldebug/duckdb}
 
 if [[ ! -x "$DUCKDB" ]]; then
@@ -26,6 +30,13 @@ if [[ ! -f "$DB_PATH" ]]; then
     echo "database not found at $DB_PATH (run generate_data.sh first)" >&2
     exit 1
 fi
+
+drop_caches() {
+    if [[ "$COLD" == "1" ]]; then
+        sync
+        sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+    fi
+}
 
 # name|query
 QUERIES=(
@@ -66,6 +77,7 @@ run_query() {
     local times=()
     for _ in $(seq 1 "$RUNS"); do
         local start end
+        drop_caches
         start=$(date +%s%N)
         "$DUCKDB" "$DB_PATH" -c "$pre $sql" > /dev/null
         end=$(date +%s%N)
@@ -77,6 +89,7 @@ run_query() {
     # scanned row groups from EXPLAIN ANALYZE (single run); a fully precomputed
     # query has no table scan at all and therefore no Row Groups Scanned text
     local analyzed scanned
+    drop_caches
     analyzed=$("$DUCKDB" "$DB_PATH" -c "$pre EXPLAIN ANALYZE $sql" 2>/dev/null | tr '\n' ' ')
     scanned=$(echo "$analyzed" | grep -oE 'Row Groups Scanned: [0-9]+ / [0-9]+' | tail -1 || true)
     if [[ -z "$scanned" ]]; then
@@ -85,6 +98,7 @@ run_query() {
 
     # result value (for correctness comparison between modes)
     local result
+    drop_caches
     result=$("$DUCKDB" "$DB_PATH" -csv -c "$pre $sql" 2>/dev/null | tail -1)
 
     echo "$name|$mode|${median_ms}ms|${scanned:-Row Groups Scanned: n/a}|$result"
