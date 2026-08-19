@@ -171,3 +171,57 @@ scan_function.projection_expression_pushdown = TableScanProjectionExpressionPush
 - **只做 CPU 层函数替换(现状)**:`LengthPropagateStats` 已把全 ASCII 列的 `length` 换成 `StrLenOperator`,但列仍全量读出;本 proposal 是同一思路向存储层的延伸。
 - **存储格式变更(offset 独立成流)**:可省 block IO(接近 TiFlash 形态),但需要格式版本迁移与 checkpoint/压缩框架改动,风险高;本 proposal 先取 CPU/内存收益,格式变更为后续独立项。
 - **生成列持久化长度**:需用户改 SQL,且与 offset 数组已有信息重复,不采用。
+
+## Appendix: Phase A 在旧基线(max-len-skip / #23611 分支)上的尝试记录(2026-08-20)
+
+### 背景
+
+Phase A 原计划在本分支(基于 2026-07 的 #23611 分支)上扩展 TypePushdown pass 支持
+length 家族函数收集,并验证 parquet 的 `strlen` 下推生效。实施过程中发现该基线无法
+低成本推进,代码修改已全部清理,此处记录问题与结论。
+
+### 已完成并验证的部分(代码已清理)
+
+- TypePushdown pass 扩展:`CastCollect`/`CastReplace` 增加 `VisitReplace(BoundFunctionExpression)`,
+  `col_to_cast` 更名 `col_to_expr`(接受 cast 与 length 家族函数),clean 投影判定与
+  冲突分析(不同函数名/返回类型 → 冲突)扩展完成,编译通过。
+- 根因确认:绑定后 `read_parquet` 的 `LogicalGet.function.projection_expression_pushdown`
+  为 nullptr——**当前分支的 parquet 从未注册该回调**(`ParquetProjectionExpressionPushdown`
+  仅存在于主干 origin/main 的 `parquet_multi_file_info.cpp:583`;此前分析 #11051 时
+  grep 到的是主干代码,误以为当前分支已有)。
+
+### 移植 parquet BYTE_LENGTH 时遭遇的接口差异(分支 vs 主干)
+
+1. **`ColumnReader::Stats` 非 virtual**(分支 `column_reader.hpp:175`):主干移植的
+   `ByteArrayLengthColumnReader` 以 `override` 内联实现 `Stats`,需改为普通成员并在 cpp 实现。
+2. **`TableFunctionProjectionExpressionInput` 语义不同**:主干字段为 `ProjectionIndex column_index`
+   (注释:用于 `get.GetColumnIds()[column_index]`);分支字段为 `idx_t proj_index`,且分支
+   TypePushdown::Optimize 传入的是**主列 id**(`GetColumnIds()[idx].GetPrimaryIndex()`),
+   回调按 projection 位置索引 `GetColumnIds()[proj_index]` 会越界——分支的传参本身是
+   潜在 bug(有列裁剪时),已修正为传 `ProjectionIndex`。
+3. **pushdown 后统计解析崩溃**:列类型被改写为 BIGINT 后,parquet 统计解析
+   (`parquet_statistics.cpp:145-147`)按 BIGINT 要求 8 字节,字符串列的 min/max 解析
+   抛出 `Incorrect stats size for type BIGINT`(EXPLAIN 阶段即触发)。主干有对应的
+   处理路径,在旧基线上还需继续挖掘适配。
+
+### 结论:分支与主干分叉过大,旧基线推进不划算
+
+- 分支基线 2026-07 vs 主干 2026-08,仅 parquet 侧差异即达
+  `parquet_reader.cpp` 646 行 + `parquet_multi_file_info.cpp` 216 行(加密、interval
+  bloom filter、schema、多文件 reader 重构等大量无关演进),每个移植点都要适配旧接口。
+- **主干(2026-08)已完整实现 #11051 的优化器侧与 parquet 侧**:TypePushdown 已模板化
+  (`PushdownOptimize<Collect, Replace>`),`CastCollect`/`CastReplace` 均有
+  `VisitReplace(BoundFunctionExpression)`(函数下推与冲突分析现成);parquet 有完整的
+  `ParquetProjectionExpressionPushdown` + `ByteArrayLengthColumnReader`。旧分支上的移植
+  是重复实现主干已有功能,且最终向社区提交仍须 rebase。
+- 统计折叠成果(Phase B/C/D)为纯优化器代码(`propagate_aggregate.cpp` + 测试),
+  与主干的冲突集中在 `MinMaxColumnInfo`/cast 支持演进,rebase 冲突面可控。
+
+### 后续建议(待办)
+
+1. 将 `max-len-skip` 分支 rebase 到 `origin/main`(需解决 `propagate_aggregate.cpp`
+   与两个测试文件的冲突;服务器 release 构建同步重建)。
+2. rebase 后 Phase A 改为**验证主干现成实现**(TypePushdown 函数下推 + parquet
+   BYTE_LENGTH 是否开箱即用),剩余工作聚焦主干缺失部分:原生表 `seq_scan` 注册
+   `projection_expression_pushdown` + StringSegment length-only 扫描路径。
+3. 本附录中的接口差异记录在主干基线上不再适用,仅作问题背景留存。
