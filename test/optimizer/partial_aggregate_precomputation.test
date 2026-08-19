@@ -1,11 +1,16 @@
 # name: test/optimizer/partial_aggregate_precomputation.test
-# description: Test partial precomputation of aggregates (count_star, min, max)
+# description: Test partial precomputation of aggregates (count_star, min, max, length functions)
 # group: [optimizer]
 
 statement ok
 SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
 require no_alternative_verify
+
+# min_string_length/total_string_length are only persisted in the V2_0_0+ storage
+# format; the default v0.10.2 compatibility format drops them on checkpoint
+statement ok
+SET storage_compatibility_version='latest';
 
 statement ok
 ATTACH '{TEST_DIR}/partial_agg.duckdb' AS db (ROW_GROUP_SIZE 2048)
@@ -317,3 +322,230 @@ query III
 SELECT count(*), min(j), max(j) FROM t3 WHERE i < 7000
 ----
 6999	0	13998
+
+#-------------------------------------------------------------------------------
+# Length function aggregates (max_len_skip Phase B/C)
+#-------------------------------------------------------------------------------
+
+# t4: strings of byte length 1..100 in every row group
+statement ok
+CREATE TABLE t4 AS (SELECT i, repeat('a', (i % 100) + 1) AS s FROM range(8192) _(i));
+
+# Reopen to clear version info so all row group stats start exact
+statement ok
+ATTACH '{TEST_DIR}/tmp_partial4.duckdb' AS tmp4
+
+statement ok
+USE tmp4
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '{TEST_DIR}/partial_agg.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+statement ok
+DETACH tmp4
+
+# Full precompute: length aggregates fold from the exact string statistics
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t4
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t4
+----
+100
+
+query II
+EXPLAIN SELECT min(strlen(s)) FROM t4
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(strlen(s)) FROM t4
+----
+1
+
+# char-length functions over all-ASCII data are exact as well
+query II
+EXPLAIN SELECT max(char_length(s)) FROM t4
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(char_length(s)) FROM t4
+----
+100
+
+# Mixed with count_star and a plain min: everything precomputes
+query II
+EXPLAIN SELECT count(*), max(strlen(s)), min(i) FROM t4
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query III
+SELECT count(*), max(strlen(s)), min(i) FROM t4
+----
+8192	100	0
+
+# An update marks row group 0 as changed: its length stats become inexact,
+# the other 3 row groups are precomputed
+statement ok
+UPDATE t4 SET s = repeat('b', 200) WHERE i = 100
+
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t4
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t4
+----
+200
+
+# MIN is partial as well: the updated row group is scanned
+query II
+EXPLAIN SELECT min(strlen(s)) FROM t4
+----
+physical_plan	<REGEX>:.*COALESCE.*least.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(strlen(s)) FROM t4
+----
+1
+
+# only the updated row group is scanned
+query II
+EXPLAIN ANALYZE SELECT max(strlen(s)) FROM t4
+----
+analyzed_plan	<REGEX>:.*Row Groups Scanned: 1 / 4.*
+
+# count and length share the scan set and merge back
+query II
+EXPLAIN SELECT count(*), max(strlen(s)) FROM t4
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT count(*), max(strlen(s)) FROM t4
+----
+8192	200
+
+# A delete makes row group 0 approximate: scanned, the rest fold into 100
+statement ok
+DELETE FROM t4 WHERE i = 100
+
+query II
+EXPLAIN ANALYZE SELECT max(strlen(s)) FROM t4
+----
+analyzed_plan	<REGEX>:.*Row Groups Scanned: 1 / 4.*
+
+query I
+SELECT max(strlen(s)) FROM t4
+----
+100
+
+# Single-value column: every string has length 5
+statement ok
+CREATE TABLE t5 AS (SELECT i, repeat('x', 5) AS s FROM range(8192) _(i));
+
+# A very long string (stored in an overflow block) mixed with short ones
+statement ok
+CREATE TABLE t6 AS (SELECT i,
+                    CASE WHEN i = 0 THEN repeat('x', 300000) ELSE repeat('a', (i % 100) + 1) END AS s
+                    FROM range(8192) _(i));
+
+# Reopen to clear version info
+statement ok
+ATTACH '{TEST_DIR}/tmp_partial5.duckdb' AS tmp5
+
+statement ok
+USE tmp5
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '{TEST_DIR}/partial_agg.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+statement ok
+DETACH tmp5
+
+# min == max for a single-value column: both fold
+query II
+EXPLAIN SELECT min(strlen(s)), max(strlen(s)) FROM t5
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), max(strlen(s)) FROM t5
+----
+5	5
+
+# the overflow string length is reflected in the exact statistics
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t6
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t6
+----
+300000
+
+query I
+SELECT min(strlen(s)) FROM t6
+----
+1
+
+# Empty table: no partition stats, no optimization
+statement ok
+CREATE TABLE t7 AS (SELECT * FROM t4 WHERE 1 = 0);
+
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t7
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t7
+----
+NULL
+
+# Grouped aggregates are not precomputed, including length functions
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t4 GROUP BY i % 10
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+# Combination with row group reordering (set_scan_order): the ordering optimization
+# and the length precomputation coexist on the same table
+query II
+EXPLAIN SELECT s FROM t4 ORDER BY s LIMIT 10
+----
+physical_plan	<REGEX>:.*TOP_N.*
+
+query I
+SELECT count(*) FROM (SELECT s FROM t4 ORDER BY s LIMIT 10) sub
+----
+10
+
+# after the checkpoint the deleted row group still carries a persistent delete
+# marker, so its stats stay inexact: the length aggregate remains partial
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t4
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t4
+----
+100
