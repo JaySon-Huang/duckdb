@@ -155,3 +155,48 @@ TryExecuteAggregates(现状):
 - **先移植 #23611 再实现**:获得不精确降级与逐分区框架,但引入其他作者的 PR 能力,超出本 proposal 范围;且 #23611 两年未合入,挂靠风险高。
 - **依赖运行时函数替换(现状)**:只省 CPU 不省 IO,不解决磁盘带宽瓶颈。
 - **length-only 扫描(#11051)**:与统计折叠正交(计划期避免扫描 vs 执行期最小化读取),独立 proposal,不在此实现。
+
+## Appendix: Upstream duckdb 相关 issue/discussion 调研(2026-08-20)
+
+### 直接相关(已合入 upstream):#23872 → PR #23873
+
+- **#23872** "`strlen` doesn't leverage string length stats for row group pruning"
+  (2026-07-16 创建):`WHERE strlen(v) > 30` 应只扫 1 个 row group,实际扫全部。
+- **PR #23873** "Prune row group for `strlen` function via string length stats":
+  已 MERGED(2026-07-20),改动 `src/function/scalar/string/length.cpp` 与
+  `test/optimizer/statistics/statistics_string_length.test`。
+
+**方向互补,不重叠**:#23873 做 **filter 场景**(`WHERE strlen(col) > N` 用
+`max_string_length` 裁剪 row group);本 proposal 做 **聚合场景**
+(`MIN/MAX(strlen/char_length(col))` 统计折叠)。**聚合场景在 upstream 没有任何
+对应 issue/PR**——本 proposal 填补的是 upstream 空白方向。
+
+main 上组合验证(本分支基于 main,含 #23873):
+
+```
+WHERE strlen(v) > 30                     → Row Groups Scanned: 1 / 2  (#23873 生效)
+SELECT max(strlen(v)) WHERE strlen(v)>30 → Row Groups Scanned: 1 / 2  (组合,裁剪叠加)
+```
+
+### 弱相关
+
+- **#23633** "Total string length records incorrectly"(已关闭):dictionary 压缩下
+  `total_string_length` 统计错误(报告 5 vs 实际 5000)——本 proposal Open Question
+  的 `SUM(LENGTH)` 跟进需注意 `total_string_length` 的统计可靠性。
+- **discussion #18657** "retain varchar(length) information":ETL 场景希望数据字典
+  保留 varchar 长度信息——元数据保留诉求,与优化无关。
+
+### 无对应
+
+- **length-only 扫描**(TiFlash #11051 对应):upstream 无任何 issue/discussion;
+  `projection_expression_pushdown` + `ParquetProjectionExpressionPushdown` 是
+  parquet 扩展的内部实现,没有对应的功能请求。
+- **`char_length` 的统计裁剪**:#23873 只覆盖 `strlen`(字节语义),`char_length`
+  的 ASCII 判定裁剪(本 proposal Phase B)upstream 也没有。
+
+### 启示
+
+1. 聚合统计折叠是 upstream 空白方向,有提交价值;提交 PR 时可引用 #23873 作为
+   "同一统计信息的不同应用方向"的上下文。
+2. `SUM(LENGTH)` 跟进需先确认 `total_string_length` 统计在压缩列上的可靠性(#23633)。
+3. 可补充 `char_length` 的 ASCII 判定裁剪(upstream 未覆盖,本 proposal 已实现)。
