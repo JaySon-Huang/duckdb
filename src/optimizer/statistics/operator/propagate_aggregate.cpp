@@ -306,23 +306,39 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	reference<LogicalOperator> child_ref = *aggr.children[0];
 	while (child_ref.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = child_ref.get().Cast<LogicalProjection>();
-		for (auto &column_info : min_max_columns) {
+		for (auto &column_info : length_columns) {
+			auto &expr = proj.GetExpression(column_info.binding);
+			if (!TryGetLengthColumnRef(expr, column_info.binding)) {
+				return;
+			}
+		}
+		// walk backwards: entries whose projection computes a byte length are moved
+		// into length_columns
+		for (idx_t i = min_max_columns.size(); i > 0; i--) {
+			auto &column_info = min_max_columns[i - 1];
 			auto &expr = proj.GetExpression(column_info.binding);
 			MinMaxColumnInfo projection_info;
 			if (!TryGetMinMaxColumnInfo(expr, projection_info)) {
-				return;
+				// the projection computes a byte length over a column, e.g. a shared
+				// strlen(col) lifted out of the aggregates - convert this entry
+				ColumnBinding length_binding;
+				if (!TryGetLengthColumnRef(expr, length_binding)) {
+					return;
+				}
+				if (column_info.result_type != expr.GetReturnType()) {
+					// the aggregate casts the projected value - not a plain length aggregate
+					return;
+				}
+				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx});
+				min_max_columns.erase(min_max_columns.begin() + (i - 1));
+				comparators.erase(comparators.begin() + (i - 1));
+				continue;
 			}
 			if (!IsSafeMinMaxCast(projection_info.result_type, column_info.input_type)) {
 				return;
 			}
 			column_info.binding = projection_info.binding;
 			column_info.input_type = projection_info.input_type;
-		}
-		for (auto &column_info : length_columns) {
-			auto &expr = proj.GetExpression(column_info.binding);
-			if (!TryGetLengthColumnRef(expr, column_info.binding)) {
-				return;
-			}
 		}
 		child_ref = *child_ref.get().children[0];
 	}
