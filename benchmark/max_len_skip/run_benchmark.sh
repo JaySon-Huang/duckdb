@@ -43,6 +43,8 @@ QUERIES=(
     # fully exact stats: zero scan expected
     "max_strlen_concentrated|SELECT max(strlen(s)) FROM len_concentrated"
     "min_strlen_concentrated|SELECT min(strlen(s)) FROM len_concentrated"
+    # CSE-lifted shared strlen: min+max in one query exercises the projection conversion
+    "minmax_strlen_concentrated|SELECT min(strlen(s)), max(strlen(s)) FROM len_concentrated"
     "max_charlen_concentrated|SELECT max(char_length(s)) FROM len_concentrated"
     "min_charlen_concentrated|SELECT min(char_length(s)) FROM len_concentrated"
     # 10% unicode row groups: MAX scans ~10%, MIN prunes them via ceil(bytes/4)
