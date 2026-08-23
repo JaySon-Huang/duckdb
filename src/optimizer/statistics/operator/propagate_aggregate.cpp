@@ -330,8 +330,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 					return;
 				}
 				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx});
-				min_max_columns.erase(min_max_columns.begin() + (i - 1));
-				comparators.erase(comparators.begin() + (i - 1));
+				min_max_columns.erase(min_max_columns.begin() + NumericCast<int64_t>(i - 1));
+				comparators.erase(comparators.begin() + NumericCast<int64_t>(i - 1));
 				continue;
 			}
 			if (!IsSafeMinMaxCast(projection_info.result_type, column_info.input_type)) {
