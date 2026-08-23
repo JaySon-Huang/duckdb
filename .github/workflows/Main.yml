@@ -32,21 +32,8 @@ on:
       - '.github/workflows/Regression.yml'
       - '.github/workflows/Extensions.yml'
   merge_group:
-  pull_request:
-    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize]
-    paths:
-      - '**'
-      - '!**.md'
-      - '!tools/**'
-      - 'tools/shell/**'
-      - '!.github/patches/duckdb-wasm/**'
-      - '!.github/workflows/**'
-      - '.github/workflows/Main.yml'
-      - '.github/workflows/Swift.yml'
-      - '.github/workflows/Windows.yml'
-      - '.github/workflows/Regression.yml'
-      - '.github/workflows/Extensions.yml'
-
+  # fork-only customization: pull_request trigger removed so each push runs one suite, not two
+  # (push events use the branch's own workflow copy; PR events would use this one via the merge ref)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
