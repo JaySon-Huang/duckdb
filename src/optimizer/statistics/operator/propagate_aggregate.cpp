@@ -38,6 +38,9 @@ struct MinMaxColumnInfo {
 	ColumnBinding binding;
 	LogicalType input_type;
 	LogicalType result_type;
+	// filled by the caller: whether the aggregate is MIN, and its position in aggr.expressions
+	bool is_min;
+	idx_t aggr_idx;
 };
 
 struct ValueComparator {
@@ -174,18 +177,14 @@ bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) 
 	return false;
 }
 
-//! Whether the function returns the byte length of its input (strlen/octet_length)
-bool IsByteLengthFunction(const Identifier &fun_name) {
-	return fun_name == "strlen" || fun_name == "octet_length";
-}
-
-//! Try to resolve the column referenced by a byte-length function expression, e.g. strlen(col)
+// Try to resolve the column referenced by a byte-length function expression, e.g. strlen(col)
 bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
 	auto &fun = expr.Cast<BoundFunctionExpression>();
-	if (!IsByteLengthFunction(fun.Function().GetName())) {
+	const auto &fun_name = fun.Function().GetName();
+	if (fun_name != "strlen" && fun_name != "octet_length") {
 		return false;
 	}
 	if (fun.GetChildren().size() != 1 ||
@@ -196,7 +195,7 @@ bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
 	return true;
 }
 
-//! Extract the exact byte length of a partition from its string statistics
+// Extract the exact byte length of a partition from its string statistics
 bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
                                 Value &result) {
 	if (!stats.partition_row_group) {
@@ -232,6 +231,14 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 	return true;
 }
 
+// Bookkeeping for a recognized byte-length aggregate (MIN/MAX of strlen/octet_length),
+// collected during recognition in TryExecuteAggregates
+struct LengthColumnInfo {
+	ColumnBinding binding;
+	bool is_min;
+	idx_t aggr_idx;
+};
+
 } // namespace
 
 void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_ptr<LogicalOperator> &node_ptr) {
@@ -239,20 +246,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		// not possible with groups
 		return;
 	}
-	// check if all aggregates are COUNT(*), MIN or MAX
+	// COUNT(*) aggregates
 	vector<idx_t> count_star_idxs;
+	// MIN/MAX aggregates over a column (possibly with a cast)
 	vector<MinMaxColumnInfo> min_max_columns;
 	vector<unique_ptr<ValueComparator>> comparators;
-	//! positions of the min/max aggregates in aggr.expressions
-	vector<idx_t> min_max_aggr_idxs;
-	//! whether the min/max aggregates are MIN, parallel to min_max_columns
-	vector<bool> min_max_is_min;
-	//! byte-length aggregates (MIN/MAX of strlen/octet_length)
-	struct LengthColumnInfo {
-		ColumnBinding binding;
-		bool is_min;
-		idx_t aggr_idx;
-	};
+	// byte-length aggregates (MIN/MAX of strlen/octet_length)
 	vector<LengthColumnInfo> length_columns;
 
 	for (idx_t i = 0; i < aggr.expressions.size(); i++) {
@@ -286,6 +285,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				length_columns.push_back({length_binding, is_min, i});
 				continue;
 			}
+			column_info.is_min = is_min;
+			column_info.aggr_idx = i;
 			min_max_columns.push_back(column_info);
 			auto comparator = GetComparator(fun_name, column_info.input_type);
 			if (!comparator) {
@@ -293,8 +294,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				return;
 			}
 			comparators.push_back(std::move(comparator));
-			min_max_aggr_idxs.push_back(i);
-			min_max_is_min.push_back(is_min);
 		} else if (fun_name == "count_star") {
 			count_star_idxs.push_back(i);
 		} else {
@@ -366,12 +365,13 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		auto &binding = length_columns[i].binding;
 		auto &column_index = get.GetColumnIndex(binding);
 		if (!get.TryGetStorageIndex(column_index, length_storage_indexes[i])) {
+			//! like the min/max indexes above, a missing storage index bails
+			//! out before the per-partition filter classification work below
 			return;
 		}
 	}
 
 	// build one constant per aggregate, in expression order
-	vector<LogicalType> types(aggr.expressions.size());
 	vector<unique_ptr<Expression>> agg_results(aggr.expressions.size());
 	bool need_to_scan = false;
 	vector<idx_t> scan_partition_indices;
@@ -467,8 +467,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 					agg_result = rhs;
 				}
 			}
-			types[min_max_aggr_idxs[agg_idx]] = agg_result.type();
-			agg_results[min_max_aggr_idxs[agg_idx]] = make_uniq<BoundConstantExpression>(agg_result);
+			agg_results[min_max_columns[agg_idx].aggr_idx] = make_uniq<BoundConstantExpression>(agg_result);
 		}
 	}
 	if (!length_columns.empty()) {
@@ -491,7 +490,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				}
 			}
 			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
-			types[aggr_idx] = agg_result.type();
 			agg_results[aggr_idx] = make_uniq<BoundConstantExpression>(agg_result);
 		}
 	}
@@ -506,7 +504,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			count += stats.count;
 		}
 		for (const auto count_star_idx : count_star_idxs) {
-			types[count_star_idx] = LogicalType::BIGINT;
 			agg_results[count_star_idx] =
 			    make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
 		}
@@ -530,13 +527,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		// Build projection expressions that merge pre-computed values with aggregate results
 		auto proj_index = optimizer.binder.GenerateTableIndex();
 		vector<unique_ptr<Expression>> proj_expressions;
-		vector<bool> is_min(aggr.expressions.size(), false);
-		for (idx_t i = 0; i < min_max_aggr_idxs.size(); i++) {
-			is_min[min_max_aggr_idxs[i]] = min_max_is_min[i];
-		}
-		for (idx_t i = 0; i < length_columns.size(); i++) {
-			is_min[length_columns[i].aggr_idx] = length_columns[i].is_min;
-		}
 		for (idx_t i = 0; i < aggr.expressions.size(); i++) {
 			auto &aggr_expr = aggr.expressions[i]->Cast<BoundAggregateExpression>();
 			auto &fun_name = aggr_expr.Function().GetName();
@@ -551,11 +541,11 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				auto add_expr = optimizer.BindScalarFunction("+", pre_count_expr->Copy(), std::move(agg_col_ref));
 				add_expr->SetAlias(aggr.expressions[i]->GetAlias());
 				proj_expressions.push_back(std::move(add_expr));
-			} else {
+			} else if (fun_name == "min" || fun_name == "max") {
 				// For min: COALESCE(least(pre_min, agg_min), pre_min)
 				// For max: COALESCE(greatest(pre_max, agg_max), pre_max)
 				auto &pre_val_expr = agg_results[i];
-				Identifier merge_func(is_min[i] ? "least" : "greatest");
+				Identifier merge_func((fun_name == "min") ? "least" : "greatest");
 				auto merged = optimizer.BindScalarFunction(merge_func, pre_val_expr->Copy(), std::move(agg_col_ref));
 				auto coalesce =
 				    make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, aggr_expr.GetReturnType());
@@ -563,6 +553,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				coalesce->GetChildrenMutable().push_back(pre_val_expr->Copy());
 				coalesce->SetAlias(aggr.expressions[i]->GetAlias());
 				proj_expressions.push_back(std::move(coalesce));
+			} else {
+				throw InternalException("Unexpected aggregate function in merge projection");
 			}
 		}
 
@@ -591,6 +583,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		agg_results[expr_idx]->SetAlias(aggr.expressions[expr_idx]->GetAlias());
 	}
 
+	// the types of the constants are the return types of the expressions themselves
+	vector<LogicalType> types;
+	types.reserve(agg_results.size());
+	for (const auto &result : agg_results) {
+		types.push_back(result->GetReturnType());
+	}
 	vector<vector<unique_ptr<Expression>>> expressions;
 	expressions.push_back(std::move(agg_results));
 	auto expression_get =
