@@ -245,6 +245,18 @@ SELECT max(strlen(y)) FROM (SELECT s || 'x' AS y FROM t)
 ----
 101
 
+# Chasing follows the outer pass-through level, then bails when the next level
+# computes a non-length expression - the aggregate executes normally
+query II
+EXPLAIN SELECT max(strlen(s)) FROM (SELECT s FROM (SELECT s || 'x' AS s FROM t))
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM (SELECT s FROM (SELECT s || 'x' AS s FROM t))
+----
+101
+
 # A subquery computing the length itself folds via the projection conversion
 query II
 EXPLAIN SELECT max(x) FROM (SELECT strlen(s) AS x FROM t)
