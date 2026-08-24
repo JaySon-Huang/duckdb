@@ -213,7 +213,7 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 		return false;
 	}
 	if (!column_stats->CanHaveNoNull()) {
-		// the partition might be entirely NULL - MIN/MAX would return NULL, so we cannot extract a value
+		// the partition is entirely NULL - MIN/MAX returns NULL, so we cannot extract a value
 		return false;
 	}
 	if (is_min) {

@@ -221,6 +221,56 @@ SELECT max(strlen(s)) FROM t_null
 ----
 NULL
 
+# A column mixing NULLs and strings still folds: MIN/MAX ignore NULLs and the
+# length statistics cover only the non-NULL values
+statement ok
+CREATE TABLE t_partial_null AS (SELECT i, CASE WHEN i % 3 = 0 THEN NULL ELSE repeat('a', (i % 100) + 1) END AS s FROM range(8192) _(i));
+
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t_partial_null
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t_partial_null
+----
+100
+
+query II
+EXPLAIN SELECT min(strlen(s)) FROM t_partial_null
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(strlen(s)) FROM t_partial_null
+----
+1
+
+# An all-NULL row group blocks the whole fold (no per-partition fallback): the
+# aggregate executes normally over the remaining row groups
+statement ok
+CREATE TABLE t_mixed_row_groups AS (SELECT i, CASE WHEN i < 2048 THEN NULL ELSE repeat('a', (i % 100) + 1) END AS s FROM range(8192) _(i));
+
+query II
+EXPLAIN SELECT max(strlen(s)) FROM t_mixed_row_groups
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(strlen(s)) FROM t_mixed_row_groups
+----
+100
+
+query II
+EXPLAIN SELECT min(strlen(s)) FROM t_mixed_row_groups
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(strlen(s)) FROM t_mixed_row_groups
+----
+1
+
 # An empty table: no partition stats, no optimization
 statement ok
 CREATE TABLE t_empty AS (SELECT * FROM t WHERE 1 = 0);
