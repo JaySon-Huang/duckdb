@@ -44,7 +44,6 @@ set(TEST_API_OBJECTS
     test_bignum.cpp
     test_threads.cpp
     test_sync_point.cpp
-    test_sync_point_precompute_race.cpp
     test_windows_header_compatibility.cpp
     test_windows_unicode_path.cpp
     test_object_cache.cpp

@@ -50,7 +50,7 @@ static constexpr double PRECOMPUTE_RACE_EXPECTED = 2048.0 + 1024.0;
 //! wrong (5120 instead of 3072, observed deterministically); on trees where the
 //! optimization is disabled the hook is unreachable and the query just returns
 //! the correct count.
-TEST_CASE("Test partial precompute partition race reproduces PR 24962", "[api][sync_point]") {
+TEST_CASE("Test partial aggregate precomputation partition race reproduces PR 24962", "[optimizer][sync_point]") {
 	auto db_path = TestDirectoryPath() + "precompute_race.duckdb";
 	duckdb::DuckDB db(nullptr);
 	Connection conn(db);
