@@ -11,7 +11,7 @@
 - 字符串全 ASCII 时，直接在该字符串上做**字节级折叠匹配**（匹配时逐字节查 `ASCII_TO_LOWER_MAP`），跳过 `LowerLength`/`LowerCase`、跳过折叠副本分配、跳过 `Utf8Proc` 调用；
 - 字符串含任何非 ASCII 字节时，**回退到现有路径**，行为与现状完全一致。
 
-触发条件比参考的 TiFlash PR（pingcap/tiflash#10400，utf8 CI collation 下 LIKE 优化）更保守：TiFlash 以"pattern 全 ASCII"为入口、在匹配中遇到非 ASCII 再回退；本提案以"单个字符串全 ASCII"为安全域。原因见 Design 1) 的正确性论证——存在会在折叠后进入 ASCII 域的非 ASCII codepoint（如 U+212A KELVIN SIGN → `k`、U+017F LONG S → `s`），仅凭 pattern 是 ASCII 无法安全地省略串侧折叠。
+触发条件比同类优化（utf8 CI collation 下 LIKE 性能优化的常见做法）更保守：以"pattern 全 ASCII"为入口、在匹配中遇到非 ASCII 再回退；本提案以"单个字符串全 ASCII"为安全域。原因见 Design 1) 的正确性论证——存在会在折叠后进入 ASCII 域的非 ASCII codepoint（如 U+212A KELVIN SIGN → `k`、U+017F LONG S → `s`），仅凭 pattern 是 ASCII 无法安全地省略串侧折叠。
 
 ## Context
 
@@ -38,7 +38,7 @@ ILIKE / NOT ILIKE 在 `src/function/scalar/string/like.cpp` 中有三条路径�
 2. `LowerCase`——第二次全串扫描并写入折叠副本；
 3. 在折叠副本上再做 matcher 扫描（`FindStrInStr` / memcmp / 递归匹配）。
 
-对于 ASCII 文本占绝大多数的典型列（日志、注释、标识符、账目），这些 UTF-8 解码与副本物化几乎没有意义。TiFlash PR #10400 在同一问题上拿到约 3-6 倍的吞吐提升（`SELECT COUNT(*) FROM orders WHERE o_comment LIKE '%ZZZ%'`，general_ci 4.1s→0.8s）。DuckDB 的统计路径只覆盖"统计已证明纯 ASCII"的列，覆盖不到"统计未知但数据实际是 ASCII"的常见场景。
+对于 ASCII 文本占绝大多数的典型列（日志、注释、标识符、账目），这些 UTF-8 解码与副本物化几乎没有意义。同类优化在其它引擎的同型场景上观测到约 3-6 倍的吞吐提升（如 `SELECT COUNT(*) FROM orders WHERE o_comment LIKE '%ZZZ%'` 这类 ASCII 高频词模式）。DuckDB 的统计路径只覆盖"统计已证明纯 ASCII"的列，覆盖不到"统计未知但数据实际是 ASCII"的常见场景。
 
 ### Constraints and Decision Drivers
 
@@ -73,7 +73,7 @@ ILIKE / NOT ILIKE 在 `src/function/scalar/string/like.cpp` 中有三条路径�
 
 **事实 B**：合法 UTF-8 中，任何非 ASCII codepoint 的编码字节全部 ≥ 0x80（首字节 0xC2-0xF4，并置字节 0x80-0xBF）。因此对非 ASCII codepoint，`fold`（无论 UTF-8 解码后的 codepoint 折叠还是字节恒等）**都不会产生任何 ASCII 字节**——除非该 codepoint 本身折叠为一个值 < 0x80 的 codepoint。这类 codepoint 确实存在：`U+212A KELVIN SIGN → U+006B 'k'`、`U+017F LATIN SMALL LETTER LONG S → U+0073 's'` 等（utf8proc case-folding 数据）。
 
-**推论 1（pattern-ASCII 不充分）**：如果 pattern 折叠后就是 `'k'`，字符串 `"K"`（Kelvin）在字符级语义下应匹配（`LowerCase("K") == "k"`）；若以"pattern 全 ASCII"为入口做字节恒等比较，会漏掉这个匹配。TiFlash 的方案通过"匹配中遇到非 ASCII 字符即回退"规避了这一点。
+**推论 1（pattern-ASCII 不充分）**：如果 pattern 折叠后就是 `'k'`，字符串 `"K"`（Kelvin）在字符级语义下应匹配（`LowerCase("K") == "k"`）；若以"pattern 全 ASCII"为入口做字节恒等比较，会漏掉这个匹配。一种常见的替代方案（pattern 全 ASCII 触发、匹配中遇到非 ASCII 字符即回退）可以规避这一点。
 
 **推论 2（字符串全 ASCII 充分）**：当字符串全部字节 < 0x80 时，每个字节就是一个 codepoint，此时：
 
@@ -127,7 +127,7 @@ ILIKE(constant pattern)
 
 - 无 `_`、无 escape：`LikeMatcher` 的 ASCII 折叠变体。segment 定位不能用裸 `FindStrInStr`（字符串未折叠，`memchr(0x61)` 找不到 `'A'`），改为"候选定位 + 逐字节折叠比较"：段首字节按折叠表展开候选（对 `'a'` 是 `'A'`/`'a'` 两个字节，可用两次 `memchr` 或一次折叠后的首字节命中评测），候选处按 `fold(str[i]) == segment[i]` 逐字节确认；前缀/后缀段用同样的折叠比较而非直接 `memcmp`。
 - 含 `_` / escape：新增模板实例 `TemplatedLikeOperator<'%', '_', true/false, ASCIILCaseReader>`——pattern 在外部已折叠（幂等，重复折叠无害），`ASCIILCaseReader` 对字符串字节查 `ASCII_TO_LOWER_MAP`；`_` 的字符边界由 `ASCIILCaseReader::NextCharacter` 处理。注意：与现有 `ILikeOperatorASCII`（like.cpp:487）的区别是现有版本直接从原始 pattern 逐行读表，新实例可用于"pattern 已折叠一次"的场景，二者可共存。
-- `IsAllASCII(const char *data, idx_t len)`：单遍检测，统一以 `static_cast<uint8_t>(data[i]) >= 0x80`（或等价的 `& 0x80` 无符号化写法）判定；**不要用 `char c < 0` 判非 ASCII**——在 `char` 为无符号的平台（Linux AArch64 等）该判断恒为假，TiFlash #10400 的 ASCII CI 路径因此把 0x80-0xFF 的字节喂进 128 项权重表造成越界读与静默错结果（见 pingcap/tiflash#11037，修复 PR #11038）。实现上可先尝试按 8 字节/64-bit 归约加速（与 `substring.cpp:210-221` 的现有循环先例相同，那里是逐字节）。放 `string_common.hpp` 或 `like.cpp` 内部，取决于复用面。
+- `IsAllASCII(const char *data, idx_t len)`：单遍检测，统一以 `static_cast<uint8_t>(data[i]) >= 0x80`（或等价的 `& 0x80` 无符号化写法）判定；**不要用 `char c < 0` 判非 ASCII**——在 `char` 为无符号的平台（Linux AArch64 等）该判断恒为假，同类 ASCII 快路径中已有因此把 0x80-0xFF 的字节喂进 128 项权重表造成越界读与静默错结果的先例。实现上可先尝试按 8 字节/64-bit 归约加速（与 `substring.cpp:210-221` 的现有循环先例相同，那里是逐字节）。放 `string_common.hpp` 或 `like.cpp` 内部，取决于复用面。
 
 **NOT ILIKE / ESCAPE 变体**：`ILikeFunction<OP, INVERT>` 模板已统一处理 `INVERT`（like.cpp:597）；`ILikeEscapeFunction<true>` 同理。快速路径内做一次 `INVERT ? !match : match`，与现有代码一致。
 
@@ -176,7 +176,7 @@ ILIKE(constant pattern)
 
 1. **sqllogictest**：扩展 `test/sql/function/string/test_ilike_constant_pattern.test` 与 `test_ilike_escape_constant_pattern.test`，或新增 `test_ilike_ascii_fastpath.test`，覆盖 Design 6) 表格全部行；保留"非 ASCII pattern 不触发"的回归用例。
 2. **结果对拍**：debug 构建中让快速路径与现有路径在随机生成的 pattern / 字符串（合法 UTF-8 + 无效 UTF-8 + NUL）上双跑并 `D_ASSERT` 结果一致，作为 sqllogictest 之外的正确性兜底（可放在测试 helper 或单测中，如 `test/api` 下的 C++ 单测）。
-3. **性能基准**：一个大表（如 10M 行），列含"ASCII 为主、少量非 ASCII"的数据且不做 ANALYZE（保证走常量 pattern 快路径而非统计路径），比较 `ILIKE '%term%'` 构建前后耗时与内存分配（`SET enable_profiling` / perf）。参考量级：TiFlash 同型优化约 3-6 倍。
+3. **性能基准**：一个大表（如 10M 行），列含"ASCII 为主、少量非 ASCII"的数据且不做 ANALYZE（保证走常量 pattern 快路径而非统计路径），比较 `ILIKE '%term%'` 构建前后耗时与内存分配（`SET enable_profiling` / perf）。参考量级：同类优化约 3-6 倍。
 4. **工程检查**：`make allunit`、`make format-fix`；收集 benchmark 数据附在 PR 描述。
 
 ## Risks and Mitigations
@@ -187,11 +187,11 @@ ILIKE(constant pattern)
 4. **最坏情形性能恶化**（ASCII 检测扫描浪费）—— 检测是单遍无分配线性扫描（逐字节 `& 0x80`，可 64-bit 归约），显著低于它替代的 `LowerLength` 扫描 + 分配 + `LowerCase` 扫描；基准验证。
 5. **collation 交互误判断**（pattern 被 collator 包裹仍显示为常量）—— 激活条件显式检查 `GetCollation` 为空；附带回归测试（ICU 扩展下 `ILIKE ... COLLATE`）。
 6. **无效 UTF-8 行为漂移** —— 回退设计已消除：快速路径不见 ≥ 0x80 字节；pattern 侧折叠先于判定，抛错行为不变。
-7. **char 符号性陷阱**（TiFlash #10400 的真实事故，见 #11037/#11038）—— 在 Linux AArch64 等 `char` 为无符号的平台上用 `c < 0` 判非 ASCII 恒为假，导致非 ASCII 字节被按 ASCII 处理并越界查表。本提案所有字节判定统一用 `static_cast<uint8_t>` 显式无符号化，并计划在 CI 中增加非 ASCII pattern 的用例（sqllogictest 覆盖 + 尽可能在 aarch64 构建上跑一遍）。
+7. **char 符号性陷阱**（同类 ASCII 快路径中已出现过的真实事故）—— 在 Linux AArch64 等 `char` 为无符号的平台上用 `c < 0` 判非 ASCII 恒为假，导致非 ASCII 字节被按 ASCII 处理并越界查表。本提案所有字节判定统一用 `static_cast<uint8_t>` 显式无符号化，并计划在 CI 中增加非 ASCII pattern 的用例（sqllogictest 覆盖 + 尽可能在 aarch64 构建上跑一遍）。
 
 ## Alternatives Considered
 
-1. **TiFlash #10400 方案（pattern-ASCII 触发 + 匹配中回退）**：入口更宽（一行字符串含非 ASCII 也能走一部分字节级匹配），但需要匹配器支持"中途放弃并重入完整路径"，且必须处理 U+212A 一类折叠入 ASCII 域的 codepoint（找到时若已消费部分 `%` 通配段，回退需要恢复状态或从行头重做）。本提案选择"行内先检测、全部 ASCII 才快速"，实现与正确性论证都更简单，安全域是构造性的。
+1. **替代方案（pattern-ASCII 触发 + 匹配中回退）**：入口更宽（一行字符串含非 ASCII 也能走一部分字节级匹配），但需要匹配器支持"中途放弃并重入完整路径"，且必须处理 U+212A 一类折叠入 ASCII 域的 codepoint（找到时若已消费部分 `%` 通配段，回退需要恢复状态或从行头重做）。本提案选择"行内先检测、全部 ASCII 才快速"，实现与正确性论证都更简单，安全域是构造性的。
 2. **仅依赖现有统计路径**：覆盖不到无统计/统计未知的列——正是本提案的目标场景。
 3. **把整个字符串折叠改为 SIMD 单遍折叠 + 匹配**：改动大、正确性风险高（UTF-8 变长、无效字节），收益不确定；列为 Phase D 研究方向。
 4. **复用 `Utf8Proc::Analyze` 做 ASCII 检测**：该函数返回 UnicodeType 并做完整校验，开销高于单遍 `& 0x80` 检测；仅在需要"无效 UTF-8 报错"语义时考虑（当前不需要——快速路径不见非法字节）。
@@ -201,4 +201,4 @@ ILIKE(constant pattern)
 1. **`IsAllASCII` 放哪、是否复用**：`substring.cpp` 有相同的内联循环先例；本提案建议提取到 `string_common.hpp` 供两处复用（若 reviewer 不赞成则各自持有一份，避免公共 API 膨胀）。实现 Phase A 时定，不影响设计。
 2. **快速匹配器的 SIMD 化**（`%` 段候选定位与折叠比较）达到什么程度：建议先实现"双候选 memchr + 逐字节折叠比较"，基准后再决定是否上 SIMD；默认不做。
 3. **是否合并统计路径**：Phase D 候选，不阻塞本提案；默认保持两条路径并存。
-4. **性能基准的验收基线**：以 TiFlash 数据（3-6 倍）为参考还是以 DuckDB 自身的绝对数字为准——建议以 DuckDB 自身构建前后对比为准，PR 描述里引用 TiFlash 量级仅作背景。
+4. **性能基准的验收基线**：以同类优化的公开量级（3-6 倍）为参考还是以 DuckDB 自身的绝对数字为准——建议以 DuckDB 自身构建前后对比为准，同类量级仅作背景。
