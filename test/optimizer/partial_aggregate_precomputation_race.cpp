@@ -36,19 +36,13 @@ static constexpr double PRECOMPUTE_RACE_EXPECTED = 2048.0 + 1024.0;
 
 } // namespace
 
-//! The partial precompute (PR #21831) records positional indices into the row
-//! group list at plan time and the scan skips by those positions at execution
-//! time. PR #24962 disabled it because a checkpoint can swap the row group
-//! collection in between: the plan-time indices then refer to different (or
-//! fewer) partitions, so a partition that was precomputed is scanned again and
-//! its rows are counted twice. This test forces exactly that interleaving with
-//! a sync point: the reader parks after capturing its indices, a second
-//! connection checkpoints (which vacuums out the fully-deleted leading row
-//! group and installs a renumbered collection), and only then is the reader
-//! released. On a tree with the partial precompute active the count comes out
-//! wrong (5120 instead of 3072, observed deterministically); on trees where the
-//! optimization is disabled the hook is unreachable and the query just returns
-//! the correct count.
+//! A checkpoint can swap the row group collection between plan-time index
+//! capture and execution-time scan: the plan-time indices then refer to different
+//! (or fewer) partitions, so a partition that was precomputed is scanned again
+//! and its rows are counted twice. This test forces exactly that interleaving
+//! with a sync point. The reader parks after capturing its indices, a second
+//! connection checkpoints (which vacuums out the fully-deleted leading row group
+//! and installs a renumbered collection), and only then is the reader released.
 TEST_CASE("Test partial aggregate precomputation partition race reproduces PR 24962", "[optimizer][sync_point]") {
 	auto db_path = TestDirectoryPath() + "precompute_race.duckdb";
 	duckdb::DuckDB db(nullptr);

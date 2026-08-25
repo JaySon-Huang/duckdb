@@ -24,8 +24,18 @@ namespace duckdb {
 //!
 //! Hook naming convention: "<component>.<subsystem>.<meaning>", e.g.
 //! "optimizer.partial_precompute.indices_captured". Add a hook only at a
-//! boundary a test needs to hold the engine at (e.g. between capturing and
-//! consuming a plan-time snapshot); each hook is a deliberate, test-only change.
+//! boundary a test needs to hold the engine at; each hook is a deliberate, test-only change.
+//!
+//! ```
+//! test thread                 business thread
+//! EnableInScope("p")      → register rendezvous
+//!                                      SYNC_POINT("p") → Sync("p")
+//!                                        (a) arrival channel: signal arrived, block on release
+//! WaitAndPause("p")       ← returns (a)
+//!   ... test-controlled work ...
+//! Next("p")                      ─────► (b) release channel: Sync("p") returns, thread continues
+//! scope exit / Disable("p") → closes channels, wakes every waiter
+//! ```
 //!
 //! Only compiled in when assertions are enabled (D_ASSERT_IS_ENABLED): in NDEBUG
 //! builds the macro expands to nothing and all control methods are no-ops.
