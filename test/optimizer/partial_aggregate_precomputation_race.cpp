@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <iostream>
 #include <thread>
 
 using namespace duckdb;
@@ -44,7 +43,7 @@ static constexpr double PRECOMPUTE_RACE_EXPECTED = 2048.0 + 1024.0;
 //! fewer) partitions, so a partition that was precomputed is scanned again and
 //! its rows are counted twice. This test forces exactly that interleaving with
 //! a sync point: the reader parks after capturing its indices, a second
-//! connection checkpoints (which vaccums out the fully-deleted leading row
+//! connection checkpoints (which vacuums out the fully-deleted leading row
 //! group and installs a renumbered collection), and only then is the reader
 //! released. On a tree with the partial precompute active the count comes out
 //! wrong (5120 instead of 3072, observed deterministically); on trees where the
@@ -67,12 +66,13 @@ TEST_CASE("Test partial aggregate precomputation partition race reproduces PR 24
 
 	auto guard = SyncPointCtl::EnableInScope("optimizer.partial_precompute.indices_captured");
 	std::atomic<double> result(-1);
+	std::string query_error;
 	RaceThreadJoiner joiner;
 	joiner.thread = std::thread([&] {
 		Connection reader(db);
 		auto res = reader.Query("SELECT count(*) FROM race_db.t WHERE key=5");
 		if (res->HasError()) {
-			std::cout << "query failed: " << res->GetError() << std::endl;
+			query_error = res->GetError();
 			return;
 		}
 		result = res->GetValue<double>(0, 0);
@@ -84,6 +84,9 @@ TEST_CASE("Test partial aggregate precomputation partition race reproduces PR 24
 	} catch (const InternalException &) {
 		precompute_active = false;
 	}
+	// the timeout fallback is the path on the current tree (the hook is
+	// unreachable while the partial precompute is disabled; see the TODO at the
+	// early return in TryExecuteAggregates)
 	if (precompute_active) {
 		// the reader is parked at the captured indices: swap the row group
 		// collection under it while it waits
@@ -91,6 +94,8 @@ TEST_CASE("Test partial aggregate precomputation partition race reproduces PR 24
 		guard.Next();
 	}
 	joiner.thread.join();
+	INFO(query_error);
+	REQUIRE(query_error.empty());
 	REQUIRE(result == PRECOMPUTE_RACE_EXPECTED);
 }
 

@@ -401,6 +401,9 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		// skips partitions by their index in the row-group list. That list can change in between
 		// (concurrent appends, checkpoints), in which case a skipped partition is scanned again and its
 		// rows are counted twice. Only the full precomputation (no scan) is safe.
+		// TODO: when this early return is removed, the race regression test
+		// (partial_aggregate_precomputation_race.cpp) must REQUIRE(precompute_active)
+		// instead of falling back to a plain correctness check.
 		return;
 	}
 	if (need_to_scan) {

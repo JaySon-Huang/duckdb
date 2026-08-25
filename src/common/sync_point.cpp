@@ -156,6 +156,8 @@ void SyncPointCtl::Sync(const char *name) {
 		return;
 	}
 	rendezvous->SignalArrival();
+	// ignoring the result is intentional: a disabled point aborts the handshake and
+	// the caller continues instead of blocking
 	rendezvous->WaitForRelease();
 }
 

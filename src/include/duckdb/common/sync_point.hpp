@@ -29,6 +29,9 @@ namespace duckdb {
 //!
 //! Only compiled in when assertions are enabled (D_ASSERT_IS_ENABLED): in NDEBUG
 //! builds the macro expands to nothing and all control methods are no-ops.
+//! D_ASSERT_IS_ENABLED is set for debug, relassert (FORCE_ASSERT=1), and
+//! FORCE_DEBUG reldebug builds - not for standard reldebug/release. Guard sync
+//! point tests with the same macro or they will not be registered.
 
 #ifdef D_ASSERT_IS_ENABLED
 #define SYNC_POINT(name) SyncPointCtl::Sync(name)
@@ -57,7 +60,9 @@ public:
 	//! Wait until the business thread reaches the point, or fail after timeout_ms.
 	void WaitAndPause(uint64_t timeout_ms);
 
-	//! Release the suspended business thread.
+	//! Release the suspended business thread. Every Next() must correspond to one
+	//! successful WaitAndPause() - extra calls accumulate release tokens and let a
+	//! later Sync() pass without blocking.
 	void Next();
 
 private:
@@ -78,7 +83,9 @@ public:
 	//! Same as WaitAndPause, but throws if the wait exceeds timeout_ms.
 	static void WaitAndPause(const char *name, uint64_t timeout_ms);
 
-	//! Continue execution after the point. Must follow a WaitAndPause.
+	//! Continue execution after the point. Every Next() must correspond to one
+	//! successful WaitAndPause() - extra calls accumulate release tokens and let a
+	//! later Sync() pass without blocking.
 	static void Next(const char *name);
 
 	//! Business-side hook: suspend the calling thread until Next is called.
