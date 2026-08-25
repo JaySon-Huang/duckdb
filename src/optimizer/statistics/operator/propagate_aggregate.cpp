@@ -3,6 +3,7 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/sync_point.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -444,6 +445,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 
 		// Tell the scan to only scan partitions whose aggregates were NOT pre-computed
 		get.SetPartitionsToScan(std::move(scan_partition_indices));
+		SYNC_POINT("optimizer.partial_precompute.indices_captured");
 
 		// Create LogicalProjection above the aggregate
 		auto projection = make_uniq<LogicalProjection>(proj_index, std::move(proj_expressions));
