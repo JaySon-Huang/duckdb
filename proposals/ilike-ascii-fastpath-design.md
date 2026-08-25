@@ -127,7 +127,7 @@ ILIKE(constant pattern)
 
 - 无 `_`、无 escape：`LikeMatcher` 的 ASCII 折叠变体。segment 定位不能用裸 `FindStrInStr`（字符串未折叠，`memchr(0x61)` 找不到 `'A'`），改为"候选定位 + 逐字节折叠比较"：段首字节按折叠表展开候选（对 `'a'` 是 `'A'`/`'a'` 两个字节，可用两次 `memchr` 或一次折叠后的首字节命中评测），候选处按 `fold(str[i]) == segment[i]` 逐字节确认；前缀/后缀段用同样的折叠比较而非直接 `memcmp`。
 - 含 `_` / escape：新增模板实例 `TemplatedLikeOperator<'%', '_', true/false, ASCIILCaseReader>`——pattern 在外部已折叠（幂等，重复折叠无害），`ASCIILCaseReader` 对字符串字节查 `ASCII_TO_LOWER_MAP`；`_` 的字符边界由 `ASCIILCaseReader::NextCharacter` 处理。注意：与现有 `ILikeOperatorASCII`（like.cpp:487）的区别是现有版本直接从原始 pattern 逐行读表，新实例可用于"pattern 已折叠一次"的场景，二者可共存。
-- `IsAllASCII(const char *data, idx_t len)`：单遍 `data[i] & 0x80`；实现上可先尝试按 8 字节/64-bit 归约加速（与 `substring.cpp:210-221` 的现有循环先例相同，那里是逐字节）。放 `string_common.hpp` 或 `like.cpp` 内部，取决于复用面。
+- `IsAllASCII(const char *data, idx_t len)`：单遍检测，统一以 `static_cast<uint8_t>(data[i]) >= 0x80`（或等价的 `& 0x80` 无符号化写法）判定；**不要用 `char c < 0` 判非 ASCII**——在 `char` 为无符号的平台（Linux AArch64 等）该判断恒为假，TiFlash #10400 的 ASCII CI 路径因此把 0x80-0xFF 的字节喂进 128 项权重表造成越界读与静默错结果（见 pingcap/tiflash#11037，修复 PR #11038）。实现上可先尝试按 8 字节/64-bit 归约加速（与 `substring.cpp:210-221` 的现有循环先例相同，那里是逐字节）。放 `string_common.hpp` 或 `like.cpp` 内部，取决于复用面。
 
 **NOT ILIKE / ESCAPE 变体**：`ILikeFunction<OP, INVERT>` 模板已统一处理 `INVERT`（like.cpp:597）；`ILikeEscapeFunction<true>` 同理。快速路径内做一次 `INVERT ? !match : match`，与现有代码一致。
 
@@ -187,6 +187,7 @@ ILIKE(constant pattern)
 4. **最坏情形性能恶化**（ASCII 检测扫描浪费）—— 检测是单遍无分配线性扫描（逐字节 `& 0x80`，可 64-bit 归约），显著低于它替代的 `LowerLength` 扫描 + 分配 + `LowerCase` 扫描；基准验证。
 5. **collation 交互误判断**（pattern 被 collator 包裹仍显示为常量）—— 激活条件显式检查 `GetCollation` 为空；附带回归测试（ICU 扩展下 `ILIKE ... COLLATE`）。
 6. **无效 UTF-8 行为漂移** —— 回退设计已消除：快速路径不见 ≥ 0x80 字节；pattern 侧折叠先于判定，抛错行为不变。
+7. **char 符号性陷阱**（TiFlash #10400 的真实事故，见 #11037/#11038）—— 在 Linux AArch64 等 `char` 为无符号的平台上用 `c < 0` 判非 ASCII 恒为假，导致非 ASCII 字节被按 ASCII 处理并越界查表。本提案所有字节判定统一用 `static_cast<uint8_t>` 显式无符号化，并计划在 CI 中增加非 ASCII pattern 的用例（sqllogictest 覆盖 + 尽可能在 aarch64 构建上跑一遍）。
 
 ## Alternatives Considered
 
