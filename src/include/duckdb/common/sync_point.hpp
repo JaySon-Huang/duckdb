@@ -21,6 +21,12 @@ namespace duckdb {
 //! enabled, the calling thread announces its arrival (making any WaitAndPause
 //! return) and then suspends until the test calls Next. Disabling the point
 //! releases every thread waiting on it.
+//!
+//! Hook naming convention: "<component>.<subsystem>.<meaning>", e.g.
+//! "optimizer.partial_precompute.indices_captured". Add a hook only at a
+//! boundary a test needs to hold the engine at (e.g. between capturing and
+//! consuming a plan-time snapshot); each hook is a deliberate, test-only change.
+//!
 //! Only compiled in when assertions are enabled (D_ASSERT_IS_ENABLED): in NDEBUG
 //! builds the macro expands to nothing and all control methods are no-ops.
 

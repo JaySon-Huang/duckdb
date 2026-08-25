@@ -445,6 +445,8 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 
 		// Tell the scan to only scan partitions whose aggregates were NOT pre-computed
 		get.SetPartitionsToScan(std::move(scan_partition_indices));
+		// tests can park the query here to mutate the row-group list between the
+		// plan-time index capture and the execution-time scan
 		SYNC_POINT("optimizer.partial_precompute.indices_captured");
 
 		// Create LogicalProjection above the aggregate
