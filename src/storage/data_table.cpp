@@ -7,6 +7,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/sync_point.hpp"
 #include "duckdb/common/types/conflict_manager.hpp"
 #include "duckdb/common/types/constraint_conflict_info.hpp"
 #include "duckdb/common/vector_size.hpp"
@@ -212,6 +213,10 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 
 	// scan the original table, and fill the new column with the transformed value
 	local_storage.ChangeType(parent, *this, changed_idx, target_type, bound_columns, cast_expr);
+
+	// tests can park the rewrite here to commit a concurrent update between the
+	// value reads and the ALTERED mark
+	SYNC_POINT("alter_type.rewrite_scan_complete");
 
 	// this table replaces the previous table, hence the parent is no longer the root DataTable
 	parent.version = DataTableVersion::ALTERED;
