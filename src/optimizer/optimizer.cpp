@@ -9,6 +9,7 @@
 #include "duckdb/optimizer/build_probe_side_optimizer.hpp"
 #include "duckdb/optimizer/column_lifetime_analyzer.hpp"
 #include "duckdb/optimizer/common_aggregate_optimizer.hpp"
+#include "duckdb/optimizer/count_distinct_rewriter.hpp"
 #include "duckdb/optimizer/cse_optimizer.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/cte_filter_pusher.hpp"
@@ -303,6 +304,12 @@ void Optimizer::RunBuiltInOptimizers() {
 		GroupingSetsOptimizer grouping_sets_optimizer(*this);
 		grouping_sets_optimizer.VisitOperator(plan);
 	});
+
+	// rewrite count(DISTINCT col) into count_star() when col is provably unique and NOT NULL
+	// (single-column PRIMARY KEY/UNIQUE constraint). Must run before the distinct-to-group-by
+	// rewrite below, which changes the shape of distinct aggregates.
+	CountDistinctRewriter count_distinct_rewriter;
+	count_distinct_rewriter.VisitOperator(plan);
 
 	// Optional aggregate recipes own their optimizer strategy; DISTINCT remains controlled by its dedicated setting.
 	MultiStageAggregateRewriter aggregate_rewriter(*this, AggregateRewritePolicy::UNCONDITIONAL,

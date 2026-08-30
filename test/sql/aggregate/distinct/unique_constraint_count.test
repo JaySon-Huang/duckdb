@@ -1,0 +1,182 @@
+# name: test/sql/aggregate/distinct/unique_constraint_count.test
+# description: count(DISTINCT col) over columns with a single-column PRIMARY KEY / UNIQUE NOT NULL constraint is rewritten to count_star() and answerable from table metadata
+# group: [distinct]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+# disable the distinct-to-group-by rewrite so the raw logical shape of the distinct
+# counts remains visible in EXPLAIN (count(DISTINCT ...) vs count_star())
+statement ok
+SET disabled_optimizers='distinct_aggregate_rewrite';
+
+statement ok
+CREATE TABLE pk(a INTEGER PRIMARY KEY, b INTEGER);
+
+statement ok
+INSERT INTO pk SELECT i, i % 100 FROM range(1000) t(i);
+
+# a PRIMARY KEY column is unique and NOT NULL in every snapshot: count(DISTINCT a) == count(*)
+statement ok
+CHECKPOINT;
+
+query II
+SELECT count(DISTINCT a), count(*) FROM pk;
+----
+1000	1000
+
+# the count over the unique column is answerable from table metadata
+query II
+EXPLAIN SELECT count(DISTINCT a), count(*) FROM pk
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# a non-unique column is not rewritten: the distinct count remains
+query II
+EXPLAIN SELECT count(DISTINCT a), count(DISTINCT b) FROM pk
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+# a UNIQUE NOT NULL column behaves like a primary key column
+statement ok
+CREATE TABLE un(a INTEGER UNIQUE NOT NULL, b INTEGER);
+
+statement ok
+INSERT INTO un SELECT i, i % 7 FROM range(500) t(i);
+
+query II
+SELECT count(DISTINCT a), count(*) FROM un;
+----
+500	500
+
+query II
+EXPLAIN SELECT count(DISTINCT a) FROM un
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# a PRIMARY KEY over a different physical type is covered as well
+statement ok
+CREATE TABLE vck(k VARCHAR PRIMARY KEY);
+
+statement ok
+INSERT INTO vck SELECT 'v' || i FROM range(100) t(i);
+
+query I
+SELECT count(DISTINCT k) FROM vck;
+----
+100
+
+query II
+EXPLAIN SELECT count(DISTINCT k) FROM vck
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# views resolve to the base table and its constraints
+statement ok
+CREATE VIEW v_pk AS SELECT a, b FROM pk;
+
+query II
+EXPLAIN SELECT count(DISTINCT a) FROM v_pk
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# committed (but not yet checkpointed) rows are part of the exact count
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO pk SELECT 5000 + i, 9 FROM range(50) t(i);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(DISTINCT a) FROM pk;
+----
+1050
+
+# rows inserted by our own transaction are visible but the metadata count is not exact
+# anymore: the rewrite stays in place, the query falls back to a regular scan (the
+# distinct hash table is gone, since count(DISTINCT a) == count(*) per snapshot)
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO pk SELECT 9000 + i, 9 FROM range(30) t(i);
+
+query II
+EXPLAIN SELECT count(DISTINCT a) FROM pk
+----
+physical_plan	<REGEX>:.*count_star\(\).*SEQ_SCAN.*
+
+query III
+SELECT count(DISTINCT a), count(a), count(*) FROM pk;
+----
+1080	1080	1080
+
+statement ok
+ROLLBACK;
+
+# a nullable UNIQUE column does not prove count(DISTINCT a) == count(*): no rewrite
+statement ok
+CREATE TABLE nul(a INTEGER UNIQUE, b INTEGER);
+
+statement ok
+INSERT INTO nul SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i END, i % 3 FROM range(100) t(i);
+
+query II
+EXPLAIN SELECT count(DISTINCT a) FROM nul
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+# count(DISTINCT a) != count(*) when NULLs are present
+query II
+SELECT count(DISTINCT a), count(*) FROM nul;
+----
+90	100
+
+# a multi-column UNIQUE constraint does not imply single-column uniqueness
+statement ok
+CREATE TABLE mc(x INTEGER, y INTEGER, UNIQUE (x, y));
+
+statement ok
+INSERT INTO mc SELECT i % 10, i % 13 FROM range(130) t(i);
+
+query II
+EXPLAIN SELECT count(DISTINCT x) FROM mc
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+# grouped count(DISTINCT) is not covered: the constraint only guarantees global uniqueness
+query II
+EXPLAIN SELECT b, count(DISTINCT a) FROM pk GROUP BY b
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+# aggregates with a FILTER clause are not equivalent to count(*)
+query II
+EXPLAIN SELECT count(DISTINCT a) FILTER (WHERE b > 5) FROM pk
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+# expression arguments are not covered by the constraint
+query II
+EXPLAIN SELECT count(DISTINCT a + 1) FROM pk
+----
+physical_plan	<REGEX>:.*count\(DISTINCT.*
+
+statement ok
+RESET disabled_optimizers;
+
+# end-to-end (default optimizers): the rewritten count short-circuits into a constant
+# before the distinct-to-group-by rewrite gets a chance to build a two-stage aggregate
+query II
+EXPLAIN SELECT count(DISTINCT a) FROM pk
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# a non-unique column keeps the two-stage distinct aggregate
+query II
+EXPLAIN SELECT count(DISTINCT b) FROM pk
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*GROUP_BY.*
