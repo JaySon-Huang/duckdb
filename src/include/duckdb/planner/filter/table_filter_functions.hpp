@@ -72,8 +72,9 @@ unique_ptr<Expression> CreateSelectivityOptionalFilterExpression(unique_ptr<Expr
 unique_ptr<Expression> CreateDynamicFilterExpression(shared_ptr<DynamicFilterData> filter_data,
                                                      const LogicalType &target_type);
 //! Variant that evaluates the dynamic filter on top of a custom input expression (e.g. a cast chain over
-//! the raw scan column). The input must return `target_type`. When `input` is nullptr, a
-//! BoundReferenceExpression(0) placeholder in `target_type` is used instead.
+//! the raw scan column, or a sort key expression pushed down by the Top-N optimizer). The input must
+//! return `target_type`. When `input` is nullptr, a BoundReferenceExpression(0) placeholder in
+//! `target_type` is used instead.
 unique_ptr<Expression> CreateDynamicFilterExpression(shared_ptr<DynamicFilterData> filter_data,
                                                      const LogicalType &target_type, unique_ptr<Expression> input);
 

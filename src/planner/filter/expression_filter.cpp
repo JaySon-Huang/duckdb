@@ -553,7 +553,7 @@ static FilterPropagateResult CheckFunctionStatistics(optional_ptr<ClientContext>
 	for (auto &child : func_expr.GetChildren()) {
 		child_stats.push_back(TryGetFilterStats(context_p, *child, input_stats, owned_stats));
 	}
-	FunctionStatisticsPruneInput input(func_expr, func_expr.BindInfo().get(), child_stats);
+	FunctionStatisticsPruneInput input(func_expr, func_expr.BindInfo().get(), child_stats, context_p);
 	return func_expr.Function().GetFilterPruneCallback()(input);
 }
 
