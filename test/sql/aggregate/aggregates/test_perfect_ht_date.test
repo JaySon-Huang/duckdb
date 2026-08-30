@@ -1,0 +1,135 @@
+# name: test/sql/aggregate/aggregates/test_perfect_ht_date.test
+# description: Test Perfect Hash Group By over DATE group columns (physical INT32, stats min/max in days)
+# group: [aggregates]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+# DATE group columns pick the Perfect Hash Group By: DATE is physically INT32 and storage
+# statistics expose min/max in days, so the range computation applies directly
+statement ok
+CREATE TABLE dates AS SELECT DATE '2024-01-01' + ((i % 365)::INTEGER) AS d, i AS val FROM range(100000) t(i);
+
+query II
+EXPLAIN SELECT d, count(*) FROM dates GROUP BY d
+----
+physical_plan	<REGEX>:.*PERFECT_HASH_GROUP_BY.*
+
+# DATE + TINYINT mixed groups: bits accumulate across group columns (3 + 2 < default threshold)
+statement ok
+CREATE TABLE mixed AS SELECT DATE '2024-01-01' + ((i % 3)::INTEGER) AS d, (i % 2)::TINYINT AS k, i AS val FROM range(1000) t(i);
+
+query II
+EXPLAIN SELECT d, k, count(*) FROM mixed GROUP BY d, k
+----
+physical_plan	<REGEX>:.*PERFECT_HASH_GROUP_BY.*
+
+query III rowsort
+SELECT d, k, count(*) FROM mixed GROUP BY d, k
+----
+2024-01-01	0	167
+2024-01-01	1	167
+2024-01-02	0	166
+2024-01-02	1	167
+2024-01-03	0	167
+2024-01-03	1	166
+
+# NULL groups: NULL occupies slot 0 in the perfect hash table
+statement ok
+CREATE TABLE null_dates AS SELECT CASE WHEN i % 100 = 0 THEN NULL ELSE DATE '2024-01-01' + ((i % 365)::INTEGER) END AS d, i AS val FROM range(100000) t(i);
+
+query II
+EXPLAIN SELECT d, count(*) FROM null_dates GROUP BY d
+----
+physical_plan	<REGEX>:.*PERFECT_HASH_GROUP_BY.*
+
+query I
+SELECT count(*) FROM (SELECT d, count(*) FROM null_dates GROUP BY d) t
+----
+366
+
+# the NULL group aggregates exactly the NULL rows of the base table
+query I
+SELECT count(*) FROM null_dates GROUP BY d HAVING d IS NULL
+----
+1000
+
+# grouping is lossless: the grouped counts add up to the table's row count
+query I
+SELECT (SELECT count(*) FROM null_dates) = (SELECT sum(c) FROM (SELECT d, count(*) AS c FROM null_dates GROUP BY d))
+----
+true
+
+# grouped sums add up to the ungrouped aggregate
+query I
+SELECT (SELECT sum(val) FROM null_dates) = (SELECT sum(s) FROM (SELECT d, sum(val) AS s FROM null_dates GROUP BY d))
+----
+true
+
+# a DATE range spanning more than the perfect hash threshold (20000 days needs 15 bits, default is 12)
+# falls back to the radix hash aggregate
+statement ok
+CREATE TABLE wide_dates AS SELECT DATE '1990-01-01' + ((i % 20000)::INTEGER) AS d, i AS val FROM range(100000) t(i);
+
+query II
+EXPLAIN SELECT d, count(*) FROM wide_dates GROUP BY d
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+# raising the threshold brings the wide range back onto the perfect hash aggregate
+statement ok
+PRAGMA perfect_ht_threshold=15;
+
+query II
+EXPLAIN SELECT d, count(*) FROM wide_dates GROUP BY d
+----
+physical_plan	<REGEX>:.*PERFECT_HASH_GROUP_BY.*
+
+# both plans compute the same result
+query I
+SELECT (SELECT count(*) FROM (SELECT d, count(*) FROM wide_dates GROUP BY d)) = 20000
+----
+true
+
+query I
+SELECT (SELECT sum(val) FROM wide_dates) = (SELECT sum(s) FROM (SELECT d, sum(val) AS s FROM wide_dates GROUP BY d))
+----
+true
+
+statement ok
+RESET perfect_ht_threshold;
+
+# forced external memory pressure: the perfect hash aggregate is in-memory only and must
+# still produce correct results
+statement ok
+SET debug_force_external=true;
+
+query I
+SELECT (SELECT count(*) FROM null_dates) = (SELECT sum(c) FROM (SELECT d, count(*) AS c FROM null_dates GROUP BY d))
+----
+true
+
+query I
+SELECT (SELECT sum(val) FROM null_dates) = (SELECT sum(s) FROM (SELECT d, sum(val) AS s FROM null_dates GROUP BY d))
+----
+true
+
+statement ok
+SET debug_force_external=false;
+
+# without statistics (VALUES clause) DATE groups do not use the perfect hash aggregate:
+# the no-statistics fallback only covers 8/16-bit integers
+query II
+EXPLAIN SELECT d, count(*) FROM (VALUES (DATE '2024-01-01'), (DATE '2024-01-02'), (NULL)) t(d) GROUP BY d
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+query I
+SELECT count(*) FROM (SELECT d, count(*) FROM (VALUES (DATE '2024-01-01'), (DATE '2024-01-02'), (NULL)) t(d) GROUP BY d) t
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT d, count(*) FROM (VALUES (DATE '2024-01-01'), (DATE '2024-01-02'), (NULL)) t(d) GROUP BY d) t WHERE d IS NULL
+----
+1
