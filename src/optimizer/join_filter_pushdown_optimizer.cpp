@@ -15,6 +15,8 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 
 namespace duckdb {
 
@@ -176,9 +178,51 @@ void JoinFilterPushdownOptimizer::GetPushdownFilterTargets(LogicalOperator &op,
 	case LogicalOperatorType::LOGICAL_DISTINCT:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 		// does not affect probe side - recurse into left child
-		// FIXME: we can probably recurse into more operators here (e.g. window, unnest)
+		// FIXME: we can probably recurse into more operators here (e.g. unnest)
 		GetPushdownFilterTargets(*probe_child.children[0], std::move(columns), targets);
 		break;
+	case LogicalOperatorType::LOGICAL_WINDOW: {
+		// a window operator neither removes rows nor modifies its child columns, but window function
+		// results can depend on every row of their partition. Pushing a join filter below the window
+		// removes probe rows that cannot match any build row - that never changes which rows match,
+		// but it does change the input of the window operator, and with it the window results of the
+		// surviving rows. The dynamic filter is a predicate on a single probe column: rows with equal
+		// values for that column are either all removed or all kept. If that column is (as a bare
+		// column reference) among the partition keys of every window expression, no window partition
+		// is ever split by the filter, and the window results of surviving rows are unchanged.
+		auto &window = probe_child.Cast<LogicalWindow>();
+		for (auto &filter : columns) {
+			if (filter.probe_column_index.table_index == window.window_index) {
+				// the filter references a window function result, which does not exist below the
+				// window - bail out
+				return;
+			}
+		}
+		for (auto &expr : window.expressions) {
+			if (expr->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+				// not a window expression - we cannot reason about it, bail out
+				return;
+			}
+			auto &window_expr = expr->Cast<BoundWindowExpression>();
+			for (auto &filter : columns) {
+				bool partitions_on_filter_column = false;
+				for (auto &partition : window_expr.Partitions()) {
+					if (partition->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+					    partition->Cast<BoundColumnRefExpression>().Binding() == filter.probe_column_index) {
+						partitions_on_filter_column = true;
+						break;
+					}
+				}
+				if (!partitions_on_filter_column) {
+					// the partition is not keyed on the filtered column, so the filter could split it
+					// and change the window results of surviving rows - bail out
+					return;
+				}
+			}
+		}
+		GetPushdownFilterTargets(*probe_child.children[0], std::move(columns), targets);
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_FILTER:
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 		GetPushdownFilterTargets(*probe_child.children[0], std::move(columns), targets);

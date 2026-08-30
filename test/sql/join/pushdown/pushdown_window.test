@@ -1,0 +1,132 @@
+# name: test/sql/join/pushdown/pushdown_window.test
+# description: Test join filter pushdown through window operators
+# group: [pushdown]
+
+# A window operator passes its child rows through unmodified, but window function results can
+# depend on every row of their partition. A join filter removes probe rows that cannot match any
+# build row - if every window expression partitions on (a bare reference to) the filtered column,
+# no window partition is ever split by the filter and the window results of surviving rows are
+# unchanged, so the filter can be pushed below the window. Windows that are not partitioned on the
+# filtered column (e.g. row_number() OVER (ORDER BY ...)) renumber their surviving rows and must
+# block the pushdown, as must filter columns that reference window outputs.
+
+statement ok
+CREATE TABLE fact AS SELECT (i // 2)::BIGINT AS fk, i::BIGINT AS fid FROM range(0, 200000) t(i);
+
+statement ok
+CREATE TABLE dim AS SELECT (90000 + i)::BIGINT AS dk, i::BIGINT AS did FROM range(0, 10000) t(i);
+
+# positive: the window is partitioned on the filtered column - the filter pushes through to the
+# fact scan below the window
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(dk\).*
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+20000
+
+# positive: aggregate window partitioned on the filtered column
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM
+  (SELECT fk, count(*) OVER (PARTITION BY fk) AS c FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(dk\).*
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, count(*) OVER (PARTITION BY fk) AS c FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+20000
+
+# the pushed filter must not change window results - the row_number values of the surviving rows
+# are identical with and without the join filter pushdown optimizer
+query II rowsort
+SELECT f.rn, count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk
+  GROUP BY f.rn ORDER BY 1;
+----
+1	10000
+2	10000
+
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown'
+
+query II rowsort
+SELECT f.rn, count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk
+  GROUP BY f.rn ORDER BY 1;
+----
+1	10000
+2	10000
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+20000
+
+statement ok
+SET disabled_optimizers = ''
+
+# negative: a window with empty partitions (no PARTITION BY) renumbers the surviving rows when
+# rows are removed below it - the pushdown must be blocked and the result must be unchanged
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+analyzed_plan	<!REGEX>:(?s).*IN.*PRF.*
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+20000
+
+# negative: the filter column is a window output - it does not exist below the window, so the
+# pushdown must be blocked
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.rn = d.dk;
+----
+analyzed_plan	<!REGEX>:(?s).*IN.*PRF.*
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fk ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.rn = d.dk;
+----
+0
+
+# negative: a window partitioned on a different column than the filtered column can be split by
+# the filter, changing window results of surviving rows - the pushdown must be blocked
+# (note: an aggregate window like count(*) OVER (PARTITION BY fid % 7) is rewritten into an
+# aggregate + self join by the window_self_join optimizer before this pass, so it does not reach
+# the window recursion; row_number windows are not rewritten)
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fid ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+analyzed_plan	<!REGEX>:(?s).*IN.*PRF.*
+
+query I
+SELECT count(*) FROM
+  (SELECT fk, row_number() OVER (PARTITION BY fid ORDER BY fid) AS rn FROM fact) f
+  JOIN dim d ON f.fk = d.dk;
+----
+20000
