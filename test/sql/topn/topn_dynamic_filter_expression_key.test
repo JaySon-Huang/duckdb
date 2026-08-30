@@ -30,7 +30,7 @@ USE db
 
 statement ok
 CREATE TABLE t AS
-SELECT i AS k, DATE '2020-01-01' + ((i // 100)::INTEGER) AS d, i % 1000 AS tie
+SELECT i AS k, DATE '2020-01-01' + ((i // 100)::INTEGER) AS d, i % 1000 AS tie, 's' || ((i % 1000)::VARCHAR) AS s
 FROM range(0, 204800) t(i) ORDER BY i;
 
 # positive: monotone expression key - the dynamic filter is pushed and prunes row groups of later
@@ -132,15 +132,15 @@ analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
 
 # parquet: monotone expression key prunes row groups (bare-column equivalence)
 statement ok
-COPY (SELECT * FROM t) TO '__TEST_DIR__/topn_expr_key.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
+COPY (SELECT * FROM t) TO '{TEST_DIR}/topn_expr_key.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
 
 query II
-EXPLAIN ANALYZE SELECT d FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 100;
+EXPLAIN ANALYZE SELECT d FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 100;
 ----
 analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*Row Groups Scanned: 1[0-9] / 100.*
 
 query I
-SELECT k FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+SELECT k FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
 ----
 0
 1
@@ -150,7 +150,7 @@ statement ok
 SET disabled_optimizers = 'TOP_N';
 
 query I
-SELECT k FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+SELECT k FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
 ----
 0
 1
@@ -158,3 +158,98 @@ SELECT k FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d
 
 statement ok
 SET disabled_optimizers = '';
+
+# second-opinion review follow-ups ------------------------------------------------
+# the pushdown guards must hold unconditionally, including the bare-column path: a type-changing
+# cast recorded in between (aggregate GROUP BY CAST / set-op child projection) must block the
+# pushdown, otherwise the filter constants (built in the sort key's type) are reinterpreted
+# against a different storage type (D_ASSERT crash in assert builds, wrong pruning in release)
+
+# negative (finding 1 regression): bare sort key through an aggregate GROUP BY CAST(...) - no
+# dynamic filter may be pushed and the result must stay correct
+statement ok
+CREATE TABLE tint AS SELECT i::INTEGER AS k FROM range(0, 204800) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 10;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+query II
+SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 3;
+----
+0	1
+1	1
+2	1
+
+# negative (finding 1 regression): casts recorded through set-op child projections
+statement ok
+CREATE TABLE ta AS SELECT i::INTEGER AS k FROM range(0, 100000) t(i);
+
+statement ok
+CREATE TABLE tb AS SELECT (100000 + i)::INTEGER AS k FROM range(100000, 200000) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 5;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 3;
+----
+0
+1
+2
+
+# positive: a cast sort key resolved through the projection - the expression is rebuilt over the
+# raw DATE column (storage type matches the inner column) and the boundary lives in the VARCHAR
+# domain; the filter is pushed and the result must be correct
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY d::VARCHAR, d LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM t ORDER BY d::VARCHAR, d, k LIMIT 3;
+----
+0
+1
+2
+
+# positive: nested deterministic functions push as well (stats derivation may yield no pruning)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY length(trim(s)), d LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM t ORDER BY length(trim(s)), d, k LIMIT 3;
+----
+0
+1
+2
+
+# negative: a pure constant sort key has no column to push a filter onto
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY 1 + 1, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# prepared statement round-trip: the dynamic filter runtime state is not serialized -
+# deserialization must safely degrade to an unfiltered scan with identical results
+statement ok
+PREPARE p_topn_expr AS SELECT d FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+
+query I
+EXECUTE p_topn_expr;
+----
+2020-01-01
+2020-01-01
+2020-01-01
+
+query I
+EXECUTE p_topn_expr;
+----
+2020-01-01
+2020-01-01
+2020-01-01

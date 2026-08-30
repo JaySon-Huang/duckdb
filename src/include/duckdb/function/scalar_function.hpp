@@ -64,7 +64,7 @@ struct FunctionStatisticsPruneInput {
 	FunctionStatisticsPruneInput(const BoundFunctionExpression &function_p, optional_ptr<FunctionData> bind_data_p,
 	                             const vector<optional_ptr<const BaseStatistics>> &child_stats_p,
 	                             optional_ptr<ClientContext> context_p = nullptr)
-	    : function(function_p), bind_data(bind_data_p), child_stats(child_stats_p), context(context_p) {
+	    : function(function_p), bind_data(bind_data_p), context(context_p), child_stats(child_stats_p) {
 	}
 
 	//! The bound function expression being checked (gives access to the argument expressions)
