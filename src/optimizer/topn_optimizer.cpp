@@ -4,6 +4,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
@@ -147,6 +148,11 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		filter_expression = order_expression->Copy();
 		has_filter_expression = true;
 	}
+	if (!sort_key_column.found) {
+		// pure constant sort key (e.g. a folded ORDER BY 1+1) - there is no column to push a
+		// filter onto
+		return;
+	}
 	// resolve through the projection nodes directly below the Top-N: the binder materializes
 	// expression sort keys (e.g. ORDER BY year(d)) in a projection below the ORDER BY, and the sort
 	// key references the materialized projection column rather than the base table column
@@ -206,13 +212,16 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		}
 		if (has_filter_expression) {
 			// expression sort key: the sort key is rebuilt over the raw scan column, so a cast chain
-			// recorded between the scan and the sort key column is out of scope - bail out
+			// recorded between the scan and the sort key column (e.g. through a GROUP BY CAST(...) or
+			// a set-op child projection) is out of scope - bail out
 			if (!pushed_column.runtime_filter_casts.empty() ||
 			    pushed_column.storage_type != sort_key_column.column_type) {
 				return;
 			}
 		} else if (RuntimeFilterCastUtil::GetRuntimeFilterInputType(pushed_column, type) != type) {
-			// the cast chain does not land in the sort key's type - bail out
+			// the cast chain does not land in the sort key's type - bail out. The filter constants
+			// are built in the sort key's type, so a type-changing cast recorded in between must be
+			// replayed (in the loop below) or rejected (here), never ignored
 			return;
 		}
 	}
