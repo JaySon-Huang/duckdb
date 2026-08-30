@@ -5,6 +5,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 
 namespace duckdb {
@@ -34,6 +35,46 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownWindow(unique_ptr<LogicalOpe
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_WINDOW);
 	auto &window = op->Cast<LogicalWindow>();
 	FilterPushdown pushdown(optimizer, convert_mark_joins, projection_mode);
+
+	// EXPERIMENT (PRUN-0007): FlattenDependentJoins wraps the dependent-join LHS in a
+	// row_number() OVER () window (alias "limit_rownum", see flatten_dependent_join.cpp)
+	// whose numbering is consumed only as the join-back key. The numbering is
+	// self-consistent within the materialized delim CTE - both consumers read the same
+	// materialization - so pushing a single-side filter below it renumbers but never
+	// changes results. Push every filter whose bindings live entirely in the child
+	// subtree. User-written row_number() OVER () windows carry a different alias and are
+	// unaffected; PushDownLimit windows carry non-empty partitions and are unaffected.
+	bool is_internal_rownum_window = false;
+	if (window.expressions.size() == 1) {
+		auto &expr = window.expressions[0];
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW && expr->HasAlias() &&
+		    expr->GetAlias() == "limit_rownum") {
+			auto &window_expr = expr->Cast<BoundWindowExpression>();
+			is_internal_rownum_window = window_expr.Partitions().empty() && window_expr.OrderByMutable().empty();
+		}
+	}
+	if (is_internal_rownum_window) {
+		unordered_set<TableIndex> child_bindings;
+		LogicalJoin::GetTableReferences(*op->children[0], child_bindings);
+		vector<unique_ptr<Filter>> leftover_filters;
+		for (idx_t i = 0; i < filters.size(); i++) {
+			bool all_in_child = true;
+			for (auto &binding : filters.at(i)->bindings) {
+				if (child_bindings.find(binding) == child_bindings.end()) {
+					all_in_child = false;
+					break;
+				}
+			}
+			if (all_in_child) {
+				pushdown.filters.push_back(std::move(filters.at(i)));
+			} else {
+				leftover_filters.push_back(std::move(filters.at(i)));
+			}
+		}
+		op->children[0] = pushdown.Rewrite(std::move(op->children[0]));
+		filters = std::move(leftover_filters);
+		return FinishPushdown(std::move(op));
+	}
 
 	// 1. Loop through the expressions, find the window expressions and investigate the partitions
 	// if a filter applies to a partition in each window expression then you can push the filter
