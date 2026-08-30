@@ -130,12 +130,18 @@ bool JoinFilterPushdownUtil::JoinTypeIsSupported(JoinType join_type) {
 	case JoinType::LEFT:
 	case JoinType::OUTER:
 	case JoinType::ANTI:
-	case JoinType::RIGHT_ANTI:
 		// cannot generate join filters for these join types
 		// mark/single - cannot change cardinality of probe side
 		// left/outer always need to include every row from probe side
-		// FIXME: anti/right_anti - we could do this, but need to invert the join conditions
+		// anti - the probe-side rows that cannot match any build-side row are exactly the rows that
+		// an anti join emits, so a probe-side filter would remove output rows
 		return false;
+	case JoinType::RIGHT_ANTI:
+		// the output of a right anti join consists of the rows of the build (right) side that do not
+		// match; the probe (left) side is only an input to match detection, so removing probe rows
+		// that cannot match any build row does not change the match status of any build row - this is
+		// the same soundness class as inner/semi/right/right_semi joins
+		return true;
 	default:
 		return true;
 	}

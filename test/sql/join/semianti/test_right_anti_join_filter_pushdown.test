@@ -1,0 +1,130 @@
+# name: test/sql/join/semianti/test_right_anti_join_filter_pushdown.test
+# description: Test join filter pushdown for RIGHT ANTI joins
+# group: [semianti]
+
+# The probe side (left child) of a RIGHT ANTI join is only an input to match detection: removing
+# probe rows that cannot match any build-side row does not change the match status of any build
+# row, so a dynamic filter can be pushed into the probe-side scan. Plain ANTI joins must keep
+# blocking the pushdown: the probe rows that cannot match are exactly the rows an anti join emits.
+
+statement ok
+CREATE TABLE fact AS SELECT (i // 2)::BIGINT AS fk, i::BIGINT AS fid FROM range(0, 200000) t(i);
+
+# build side: keys 0..499 match the fact table, keys 100000..100004 do not
+statement ok
+CREATE TABLE build_side AS
+SELECT (i // 2)::BIGINT AS bkey, i::BIGINT AS bid FROM range(0, 1000) t(i)
+UNION ALL
+SELECT 100000 + (i // 2)::BIGINT AS bkey, 1000 + i::BIGINT AS bid FROM range(0, 10) t(i);
+
+# fact table with NULLs in the join key (probe side of the flipped join)
+statement ok
+CREATE TABLE fact_null AS SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE (i // 2)::BIGINT END AS fk, i::BIGINT AS fid FROM range(0, 200000) t(i);
+
+# build side with NULLs in the join key
+statement ok
+CREATE TABLE build_side_null AS
+SELECT (i // 2)::BIGINT AS bkey, i::BIGINT AS bid FROM range(0, 1000) t(i)
+UNION ALL
+SELECT 100000 + (i // 2)::BIGINT AS bkey, 1000 + i::BIGINT AS bid FROM range(0, 10) t(i)
+UNION ALL
+SELECT NULL::BIGINT AS bkey, 2000 + i::BIGINT AS bid FROM range(0, 3) t(i);
+
+# the join flips to a RIGHT ANTI join (cheap left side becomes the build side) - the flipped
+# orientation now generates a join filter on the fact scan
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+analyzed_plan	<REGEX>:(?s).*RIGHT_ANTI.*
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(bkey\).*
+
+query I
+SELECT count(*) FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+10
+
+query II rowsort
+SELECT * FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+100000	1000
+100000	1001
+100001	1002
+100001	1003
+100002	1004
+100002	1005
+100003	1006
+100003	1007
+100004	1008
+100004	1009
+
+# the same query without the join filter pushdown optimizer must produce identical results
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown'
+
+query I
+SELECT count(*) FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+10
+
+query II rowsort
+SELECT * FROM build_side b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+100000	1000
+100000	1001
+100001	1002
+100001	1003
+100002	1004
+100002	1005
+100003	1006
+100003	1007
+100004	1008
+100004	1009
+
+statement ok
+SET disabled_optimizers = ''
+
+# NULL probe-side rows cannot match any build row - the dynamic filter drops them and the result
+# must be unchanged
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM build_side b ANTI JOIN fact_null f ON f.fk = b.bkey;
+----
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(bkey\).*
+
+query I
+SELECT count(*) FROM build_side b ANTI JOIN fact_null f ON f.fk = b.bkey;
+----
+10
+
+# NULL build-side rows match nothing, so they are emitted by the right anti join regardless of any
+# probe-side filtering
+query I
+SELECT count(*) FROM build_side_null b ANTI JOIN fact f ON f.fk = b.bkey;
+----
+13
+
+query II rowsort
+SELECT bkey, count(*) FROM build_side_null b ANTI JOIN fact f ON f.fk = b.bkey GROUP BY bkey ORDER BY 1 NULLS LAST;
+----
+100000	2
+100001	2
+100002	2
+100003	2
+100004	2
+NULL	3
+
+# plain ANTI joins are a correctness guard - the probe rows that cannot match are exactly the
+# output rows, so no join filter may be generated (the join does not flip: the right side is much
+# cheaper to build on)
+query I
+SELECT count(*) FROM fact f ANTI JOIN build_side b ON f.fk = b.bkey;
+----
+199000
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM fact f ANTI JOIN build_side b ON f.fk = b.bkey;
+----
+analyzed_plan	<!REGEX>:(?s).*IN.*PRF.*
