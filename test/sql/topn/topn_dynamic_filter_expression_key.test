@@ -1,0 +1,160 @@
+# name: test/sql/topn/topn_dynamic_filter_expression_key.test
+# description: Test Top-N dynamic filter pushdown for expression sort keys (e.g. ORDER BY year(d))
+# group: [topn]
+
+# The Top-N dynamic filter boundary lives in the sort key value domain: the heap boundary is the
+# decoded sort key value of the first order clause. For expression sort keys the pushed filter must
+# therefore evaluate the same expression over the raw scan column. Deterministic expressions over a
+# single column are pushed; anything else (multiple columns, non-deterministic functions, CASE, ...)
+# must bail out. Non-monotone functions push safely but cannot prune row groups (no zonemap
+# derivation), monotone functions prune.
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+require no_alternative_verify
+
+require parquet
+
+require vector_size 2048
+
+statement ok
+SET threads TO 1;
+
+# ordered data: 100 rows per day, so every row group spans ~20 days
+statement ok
+ATTACH '{TEST_DIR}/topn_expr_key.duckdb' AS db (ROW_GROUP_SIZE 2048);
+
+statement ok
+USE db
+
+statement ok
+CREATE TABLE t AS
+SELECT i AS k, DATE '2020-01-01' + ((i // 100)::INTEGER) AS d, i % 1000 AS tie
+FROM range(0, 204800) t(i) ORDER BY i;
+
+# positive: monotone expression key - the dynamic filter is pushed and prunes row groups of later
+# years (row groups 0..18 cover 2020, the rest starts at 2021)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY year(d), d, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*Row Groups Scanned: 1[0-9] / 100.*
+
+query I
+SELECT count(*) FROM t WHERE year(d) > 2020
+----
+168200
+
+# the pushed filter must not change the result
+query I
+SELECT k FROM t ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query I
+SELECT k FROM t ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = '';
+
+# positive: DESC NULLS FIRST with an expression key over a nullable column
+statement ok
+CREATE TABLE tn AS
+SELECT i AS k, CASE WHEN i % 100 = 0 THEN NULL ELSE DATE '2020-01-01' + ((i // 100)::INTEGER) END AS d, i % 1000 AS tie
+FROM range(0, 204800) t(i) ORDER BY i;
+
+query II
+EXPLAIN ANALYZE SELECT d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT count(*) FROM tn WHERE d IS NULL
+----
+2048
+
+query II
+SELECT k, d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie, k LIMIT 2;
+----
+0	NULL
+1000	NULL
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query II
+SELECT k, d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie, k LIMIT 2;
+----
+0	NULL
+1000	NULL
+
+statement ok
+SET disabled_optimizers = '';
+
+# negative: expression over multiple columns - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY year(d) + k, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# negative: CASE expression - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY CASE WHEN k > 0 THEN 1 ELSE 2 END, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# negative: volatile function - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY ((k * 9301 + 49297) % 233280) + random()::INT, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# a non-monotone expression key (abs) pushes safely but cannot derive zonemaps - filter is present
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY abs(k - 100000), d LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+# plain column keys keep their dynamic filter (regression guard)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY d, k LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+# parquet: monotone expression key prunes row groups (bare-column equivalence)
+statement ok
+COPY (SELECT * FROM t) TO '__TEST_DIR__/topn_expr_key.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
+
+query II
+EXPLAIN ANALYZE SELECT d FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*Row Groups Scanned: 1[0-9] / 100.*
+
+query I
+SELECT k FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query I
+SELECT k FROM read_parquet('__TEST_DIR__/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = '';
