@@ -12,9 +12,11 @@
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/optimizer/runtime_filter_cast.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 
@@ -53,6 +55,20 @@ bool ExtractSortKeyColumn(const Expression &expr, TopNSortKeyColumn &result) {
 			// the dynamic filter re-evaluates the expression in a different execution context, so
 			// it must return identical values there - bail on volatile/query-stable functions
 			return false;
+		}
+		if (BoundCastExpression::IsCast(expr)) {
+			// casts inside the sort key must satisfy the same order-preservation criterion as the
+			// bare-column cast chains: no new NULLs (an explicit TRY_CAST maps failing inputs to
+			// NULL, so pruning would silently drop rows the sort key ranks as NULL), no throw at
+			// evaluation time (pruning would swallow the error), and an order-preserving integral
+			// widening (non-monotone casts would make the min/max statistics derivation unsound).
+			// RuntimeFilterCastCanFail is exactly the predicate the cast-chain replay machinery
+			// uses - reuse it instead of re-deriving the criteria
+			if (BoundCastExpression::IsTryCast(function) ||
+			    RuntimeFilterCastUtil::RuntimeFilterCastCanFail(BoundCastExpression::SourceType(function),
+			                                                    function.GetReturnType())) {
+				return false;
+			}
 		}
 		for (auto &child : function.GetChildren()) {
 			if (!ExtractSortKeyColumn(*child, result)) {
@@ -274,8 +290,8 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 			filter_input = build_filter_child();
 		} else {
 			bool preserves_cast_errors = false;
-			filter_input =
-			    RuntimeFilterCastUtil::CreateRuntimeFilterInputExpression(context, pushed_column, preserves_cast_errors);
+			filter_input = RuntimeFilterCastUtil::CreateRuntimeFilterInputExpression(context, pushed_column,
+			                                                                         preserves_cast_errors);
 			D_ASSERT(filter_input->GetReturnType() == type);
 			D_ASSERT(!preserves_cast_errors);
 		}

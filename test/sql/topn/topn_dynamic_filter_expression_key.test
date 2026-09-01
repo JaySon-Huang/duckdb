@@ -160,20 +160,21 @@ statement ok
 SET disabled_optimizers = '';
 
 # second-opinion review follow-ups ------------------------------------------------
-# the pushdown guards must hold unconditionally, including the bare-column path: a type-changing
-# cast recorded in between (aggregate GROUP BY CAST / set-op child projection) must block the
-# pushdown, otherwise the filter constants (built in the sort key's type) are reinterpreted
-# against a different storage type (D_ASSERT crash in assert builds, wrong pruning in release)
+# since the order-preserving cast-chain replay machinery (dynamic filters through widening
+# integral casts) is in place, a type-changing cast recorded in between (aggregate GROUP BY
+# CAST(...) / set-op child projection) is replayed on the filter input instead of reinterpreting
+# the constants - the pushdown is now valid. Casts that are not order-preserving (an explicit
+# TRY_CAST, or a cast that can throw) still bail out
 
-# negative (finding 1 regression): bare sort key through an aggregate GROUP BY CAST(...) - no
-# dynamic filter may be pushed and the result must stay correct
+# positive: bare sort key through an aggregate GROUP BY CAST(...) - the widening integral cast
+# chain is replayed on the filter input, the result must stay correct
 statement ok
 CREATE TABLE tint AS SELECT i::INTEGER AS k FROM range(0, 204800) t(i);
 
 query II
 EXPLAIN ANALYZE SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 10;
 ----
-analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
 
 query II
 SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 3;
@@ -182,7 +183,7 @@ SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORD
 1	1
 2	1
 
-# negative (finding 1 regression): casts recorded through set-op child projections
+# positive: casts recorded through set-op child projections are replayed as well
 statement ok
 CREATE TABLE ta AS SELECT i::INTEGER AS k FROM range(0, 100000) t(i);
 
@@ -192,7 +193,7 @@ CREATE TABLE tb AS SELECT (100000 + i)::INTEGER AS k FROM range(100000, 200000) 
 query II
 EXPLAIN ANALYZE SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 5;
 ----
-analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
 
 query I
 SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 3;
@@ -201,13 +202,27 @@ SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS 
 1
 2
 
-# positive: a cast sort key resolved through the projection - the expression is rebuilt over the
-# raw DATE column (storage type matches the inner column) and the boundary lives in the VARCHAR
-# domain; the filter is pushed and the result must be correct
+# negative: a TRY_CAST sort key must not push - the cast creates new NULLs (failing inputs rank
+# as NULL), so the dynamic filter would silently drop rows the sort key ranks as NULL
+query II
+EXPLAIN SELECT TRY_CAST(k AS TINYINT) AS x, count(*) FROM tint GROUP BY TRY_CAST(k AS TINYINT) ORDER BY x LIMIT 10;
+----
+physical_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+query II
+SELECT TRY_CAST(k AS TINYINT) AS x, count(*) FROM tint GROUP BY TRY_CAST(k AS TINYINT) ORDER BY x LIMIT 3;
+----
+0	1
+1	1
+2	1
+
+# negative: a VARCHAR cast sort key is not order-preserving ('10' < '2' lexicographically), so
+# the min/max statistics derivation would be unsound - must not push (same criterion as the
+# bare-column cast chains)
 query II
 EXPLAIN ANALYZE SELECT d FROM t ORDER BY d::VARCHAR, d LIMIT 100;
 ----
-analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
 
 query I
 SELECT k FROM t ORDER BY d::VARCHAR, d, k LIMIT 3;
