@@ -1,6 +1,6 @@
 # name: test/sql/join/mark/test_null_safe_semi_uncommitted_stats.test
 # description: Issue #25266 - IS NOT DISTINCT FROM semi-join must not be degraded to '=' while the transaction holds uncommitted appends
-# group: [join]
+# group: [mark]
 
 # Regression test for https://github.com/duckdb/duckdb/issues/25266
 #

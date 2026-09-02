@@ -38,6 +38,8 @@ PhysicalOperator &PhysicalPlanGenerator::ResolveAndPlan(unique_ptr<LogicalOperat
 
 	// Resolve the column references.
 	{
+		// normalize join condition column names before they are baked into the physical plan
+		LogicalComparisonJoin::NormalizeConditionColumnNames(*op);
 		auto timer = profiler.StartTimer<MetricPhysicalPlannerColumnBinding>();
 		ColumnBindingResolver resolver;
 		resolver.VisitOperator(*op);

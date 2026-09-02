@@ -69,6 +69,13 @@ public:
 
 	bool HasEquality(idx_t &range_count) const;
 	bool HasArbitraryConditions() const;
+
+	//! Resolve the name of a join condition column from the child subtree that produces it. Returns false when the
+	//! column cannot be traced to a named source.
+	static bool TryResolveConditionColumnName(const LogicalOperator &child, const Expression &side, string &result);
+	//! Update join condition column references with the names of the columns they actually reference. The alias of a
+	//! condition side can be stale after decorrelation rewrites.
+	static void NormalizeConditionColumnNames(LogicalOperator &op);
 };
 
 } // namespace duckdb

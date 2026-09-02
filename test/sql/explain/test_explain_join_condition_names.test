@@ -1,0 +1,33 @@
+# name: test/sql/explain/test_explain_join_condition_names.test
+# description: EXPLAIN must render both sides of join conditions with their actual column names
+# group: [explain]
+
+# A correlated EXISTS plans as a MARK join over a delim join: the outer column is pushed into the
+# subquery as a delim copy, and the deliminator later replaces that copy's binding with the actual
+# subquery-side column. The rewritten join condition must display the real column names - not the
+# outer column's name on both sides.
+
+statement ok
+CREATE TABLE a(x INTEGER)
+
+statement ok
+CREATE TABLE b(y INTEGER)
+
+# overlapping ranges keep the optimizer from folding the join into an empty result, and the NULLs
+# keep both join keys nullable so the null-safe semi-join simplification does not rewrite the
+# IS NOT DISTINCT FROM condition below into '='
+statement ok
+INSERT INTO a VALUES (1), (2), (NULL)
+
+statement ok
+INSERT INTO b VALUES (2), (NULL)
+
+query II
+EXPLAIN SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a.x = b.y)
+----
+physical_plan	<REGEX>:.*Conditions: x = y.*
+
+query II
+EXPLAIN SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a.x IS NOT DISTINCT FROM b.y)
+----
+physical_plan	<REGEX>:.*Conditions: x IS NOT DISTINCT FROM y.*
