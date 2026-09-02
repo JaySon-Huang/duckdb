@@ -1,0 +1,49 @@
+# name: test/sql/join/mark/test_null_safe_semi_uncommitted_stats.test
+# description: Issue #25266 - IS NOT DISTINCT FROM semi-join must not be degraded to '=' while the transaction holds uncommitted appends
+# group: [join]
+
+# Regression test for https://github.com/duckdb/duckdb/issues/25266
+#
+# A correlated EXISTS with a null-safe equality plans as a SEMI join whose condition is
+# IS NOT DISTINCT FROM. When a join key is proven NOT NULL from table statistics,
+# SimplifyNullSafeSemiJoinConditions rewrites the condition to a regular '='. The proof comes
+# from table->GetStatistics(), which only covers committed row groups: a NULL appended by an
+# earlier statement of the SAME transaction lives in LocalStorage - visible to the scan,
+# invisible to the statistics. The rewrite then drops the NULL==NULL match, so the probe row
+# with x = NULL is lost.
+
+statement ok
+CREATE TABLE a(x INTEGER);
+
+statement ok
+INSERT INTO a VALUES (1), (NULL);
+
+# b.y currently has no NULLs: its committed statistics claim NOT NULL
+statement ok
+CREATE TABLE b(y INTEGER);
+
+statement ok
+INSERT INTO b VALUES (1);
+
+statement ok
+BEGIN;
+
+# same transaction, earlier statement: b becomes {1, NULL}, but the statistics snapshot
+# taken now does not see this row
+statement ok
+INSERT INTO b VALUES (NULL);
+
+# a.x = NULL should match b.y = NULL under IS NOT DISTINCT FROM, so both rows of a pass
+query I
+SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a.x IS NOT DISTINCT FROM b.y);
+----
+2
+
+statement ok
+COMMIT;
+
+# the same query is correct after the append is committed (statistics are up to date)
+query I
+SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a.x IS NOT DISTINCT FROM b.y);
+----
+2
