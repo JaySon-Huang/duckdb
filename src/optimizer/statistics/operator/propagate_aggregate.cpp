@@ -174,8 +174,10 @@ bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) 
 	return false;
 }
 
-// Try to resolve the column referenced by strlen(VARCHAR) or octet_length(BLOB)
-bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
+enum class LengthFunctionKind : uint8_t { BYTE_LENGTH, CHARACTER_LENGTH };
+
+// Try to resolve strlen(VARCHAR), octet_length(BLOB), or a VARCHAR character-length function
+bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding, LengthFunctionKind &kind) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
@@ -186,35 +188,63 @@ bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
 	}
 	const auto &fun_name = fun.Function().GetName();
 	const auto arg_type = fun.GetChildren()[0]->GetReturnType().id();
-	// octet_length(BIT) is GetSize()-1; string stats store GetSize()
-	const bool is_byte_length = (fun_name == "strlen" && arg_type == LogicalTypeId::VARCHAR) ||
-	                            (fun_name == "octet_length" && arg_type == LogicalTypeId::BLOB);
-	if (!is_byte_length) {
+	LengthFunctionKind detected_kind;
+	if (fun_name == "strlen" && arg_type == LogicalTypeId::VARCHAR) {
+		detected_kind = LengthFunctionKind::BYTE_LENGTH;
+	} else if (fun_name == "octet_length") {
+		// octet_length(BIT) is GetSize()-1; string stats store GetSize()
+		if (arg_type != LogicalTypeId::BLOB) {
+			return false;
+		}
+		detected_kind = LengthFunctionKind::BYTE_LENGTH;
+	} else if (fun_name == "length" || fun_name == "len" || fun_name == "char_length" ||
+	           fun_name == "character_length") {
+		// character counts are only derivable from string statistics - length() is
+		// also defined for lists and bitstrings
+		if (arg_type != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		detected_kind = LengthFunctionKind::CHARACTER_LENGTH;
+	} else {
 		return false;
 	}
 	binding = fun.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+	kind = detected_kind;
 	return true;
 }
 
-// Extract the exact byte length of a partition from its string statistics
-bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
-                                Value &result) {
+// Fetch the string statistics of a partition, after the shared validity guards
+unique_ptr<BaseStatistics> GetStringColumnStats(const PartitionStatistics &stats, const StorageIndex &storage_index) {
 	if (!stats.partition_row_group) {
-		return false;
+		return nullptr;
 	}
 	auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
 	if (!column_stats) {
-		return false;
+		return nullptr;
 	}
 	if (!stats.partition_row_group->MinMaxIsExact(storage_index) || stats.partition_row_group->HasPendingWrites()) {
-		return false;
+		return nullptr;
 	}
 	if (column_stats->GetStatsType() != StatisticsType::STRING_STATS) {
-		// no length statistics available for this type
-		return false;
+		return nullptr;
 	}
 	if (!column_stats->CanHaveNoNull()) {
 		// the partition is entirely NULL - MIN/MAX returns NULL, so we cannot extract a value
+		return nullptr;
+	}
+	return column_stats;
+}
+
+// Extract the exact length of a partition from its string statistics: byte length
+// always, character length only when the partition is ASCII-only
+bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index,
+                                LengthFunctionKind kind, bool is_min, Value &result) {
+	auto column_stats = GetStringColumnStats(stats, storage_index);
+	if (!column_stats) {
+		return false;
+	}
+	if (kind == LengthFunctionKind::CHARACTER_LENGTH && StringStats::CanContainUnicode(*column_stats)) {
+		// character counts only equal byte counts when the partition is ASCII-only
 		return false;
 	}
 	if (is_min) {
@@ -232,13 +262,147 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 	return true;
 }
 
+// Extract the character-length statistic of a partition: the exact value when the
+// partition is ASCII-only, otherwise the safe bound derived from its byte lengths
+// (characters never exceed bytes, and each character needs at most four bytes)
+bool TryGetCharLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
+                                    bool &ascii_only, Value &result) {
+	auto column_stats = GetStringColumnStats(stats, storage_index);
+	if (!column_stats) {
+		return false;
+	}
+	ascii_only = !StringStats::CanContainUnicode(*column_stats);
+	if (is_min) {
+		auto min_length = StringStats::MinStringLength(*column_stats);
+		if (!min_length.IsValid()) {
+			return false;
+		}
+		const auto min_bytes = min_length.GetIndex();
+		result =
+		    Value::BIGINT(ascii_only ? NumericCast<int64_t>(min_bytes) : NumericCast<int64_t>((min_bytes + 3) / 4));
+	} else {
+		if (!StringStats::HasMaxStringLength(*column_stats)) {
+			return false;
+		}
+		result = Value::BIGINT(NumericCast<int64_t>(StringStats::MaxStringLength(*column_stats)));
+	}
+	return true;
+}
+
 // Bookkeeping for a recognized byte-length aggregate (MIN/MAX of strlen/octet_length),
 // collected during recognition in TryExecuteAggregates
 struct LengthColumnInfo {
 	ColumnBinding binding;
 	bool is_min;
 	idx_t aggr_idx;
+	LengthFunctionKind kind;
 };
+
+// Fold character-length MIN/MAX from exact ASCII partitions; prune unicode-possible
+// partitions whose byte-length bounds cannot contribute to the global extreme.
+// Returns false if the optimization must abort.
+bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_aggregates,
+                                      const vector<LengthColumnInfo> &length_columns,
+                                      const vector<StorageIndex> &length_storage_indexes,
+                                      vector<PartitionStatistics> &partition_stats,
+                                      vector<unique_ptr<Expression>> &agg_results, bool &need_to_scan,
+                                      vector<idx_t> &scan_partition_indices) {
+	bool has_char_entries = false;
+	bool char_only = !has_other_aggregates;
+	for (const auto &entry : length_columns) {
+		if (entry.kind == LengthFunctionKind::CHARACTER_LENGTH) {
+			has_char_entries = true;
+		} else {
+			char_only = false;
+		}
+	}
+	if (!has_char_entries) {
+		return true;
+	}
+	if (has_table_filters && need_to_scan) {
+		// Residual filter partitions are tracked by original row-group index, while this
+		// function indexes into the already-filtered partition_stats list. Mixing the two
+		// scan lists is not supported. Fully classified filters are safe: remaining
+		// partitions are FILTER_ALWAYS_TRUE, so their stats describe every surviving row
+		// and folding them is the same as folding a smaller unfiltered table.
+		return false;
+	}
+
+	vector<bool> needs_scan(partition_stats.size(), false);
+	vector<bool> unicode_possible(partition_stats.size(), false);
+	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
+		auto &entry = length_columns[agg_idx];
+		// byte-length aggregates are handled outside of this function
+		if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
+			continue;
+		}
+		// character-length aggregates are folded from ascii-only partitions
+		const auto &storage_index = length_storage_indexes[agg_idx];
+		optional<Value> candidate;
+		vector<bool> is_ascii_only(partition_stats.size(), false);
+		vector<Value> bounds(partition_stats.size());
+		// ASCII partitions reduce into candidate; unicode partitions keep a safe bound
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			bool ascii_only;
+			Value value;
+			if (!TryGetCharLengthValueFromStats(partition_stats[partition_idx], storage_index, entry.is_min, ascii_only,
+			                                    value)) {
+				return false;
+			}
+			is_ascii_only[partition_idx] = ascii_only;
+			if (!ascii_only) {
+				unicode_possible[partition_idx] = true;
+				bounds[partition_idx] = std::move(value);
+				continue;
+			}
+			if (!candidate.has_value() || (entry.is_min ? value < *candidate : value > *candidate)) {
+				candidate = std::move(value);
+			}
+		}
+		if (!candidate.has_value()) {
+			// No ASCII partition to fold from. Bounds can still prune unicode partitions
+			// against each other - left as a follow-up.
+			return false;
+		}
+		agg_results[entry.aggr_idx] = make_uniq<BoundConstantExpression>(*candidate);
+
+		// classify the unicode-possible partitions against the candidate
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (is_ascii_only[partition_idx]) {
+				continue;
+			}
+			const bool skippable =
+			    entry.is_min ? bounds[partition_idx] > *candidate : bounds[partition_idx] < *candidate;
+			if (!skippable) {
+				needs_scan[partition_idx] = true;
+			}
+		}
+	}
+
+	// Pruned partitions can only be dropped when every aggregate is a character-length
+	// entry; mixed queries still need these rows. Same-direction mixes can vote to
+	// prune together - left as a follow-up.
+	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+		if (unicode_possible[partition_idx] && !needs_scan[partition_idx] && !char_only) {
+			needs_scan[partition_idx] = true;
+		}
+		if (needs_scan[partition_idx]) {
+			need_to_scan = true;
+			scan_partition_indices.push_back(partition_idx);
+		}
+	}
+
+	// scanned partitions are merged back through the partial precompute, pruned ones
+	// are proven irrelevant and removed
+	vector<PartitionStatistics> kept_partitions;
+	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+		if (!needs_scan[partition_idx] && !unicode_possible[partition_idx]) {
+			kept_partitions.push_back(std::move(partition_stats[partition_idx]));
+		}
+	}
+	partition_stats = std::move(kept_partitions);
+	return true;
+}
 
 } // namespace
 
@@ -280,10 +444,11 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			if (!TryGetMinMaxColumnInfo(*aggr_expr.GetChildren()[0], column_info)) {
 				// min/max over a byte-length function, e.g. MAX(strlen(col))
 				ColumnBinding length_binding;
-				if (!TryGetLengthColumnRef(*aggr_expr.GetChildren()[0], length_binding)) {
+				LengthFunctionKind length_kind;
+				if (!TryGetLengthColumnRef(*aggr_expr.GetChildren()[0], length_binding, length_kind)) {
 					return;
 				}
-				length_columns.push_back({length_binding, is_min, i});
+				length_columns.push_back({length_binding, is_min, i, length_kind});
 				continue;
 			}
 			column_info.is_min = is_min;
@@ -314,7 +479,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				column_info.binding = expr.Cast<BoundColumnRefExpression>().Binding();
 				continue;
 			}
-			if (!TryGetLengthColumnRef(expr, column_info.binding)) {
+			if (!TryGetLengthColumnRef(expr, column_info.binding, column_info.kind)) {
 				return;
 			}
 		}
@@ -328,14 +493,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				// the projection computes a byte length over a column, e.g. a shared
 				// strlen(col) lifted out of the aggregates - convert this entry
 				ColumnBinding length_binding;
-				if (!TryGetLengthColumnRef(expr, length_binding)) {
+				LengthFunctionKind length_kind;
+				if (!TryGetLengthColumnRef(expr, length_binding, length_kind)) {
 					return;
 				}
 				if (column_info.result_type != expr.GetReturnType()) {
 					// the aggregate casts the projected value - not a plain length aggregate
 					return;
 				}
-				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx});
+				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx, length_kind});
 				min_max_columns.erase(min_max_columns.begin() + NumericCast<int64_t>(i - 1));
 				comparators.erase(comparators.begin() + NumericCast<int64_t>(i - 1));
 				continue;
@@ -468,6 +634,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
+	if (!TryFoldCharacterLengthAggregates(
+	        get.table_filters.HasFilters(), !min_max_columns.empty() || !count_star_idxs.empty(), length_columns,
+	        length_storage_indexes, partition_stats, agg_results, need_to_scan, scan_partition_indices)) {
+		return;
+	}
+
 	if (!min_max_columns.empty()) {
 		// Execute min/max aggregates on partition statistics
 		for (idx_t agg_idx = 0; agg_idx < min_max_storage_indexes.size(); agg_idx++) {
@@ -493,18 +665,23 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 	if (!length_columns.empty()) {
-		// Execute byte-length aggregates on partition statistics
+		// Execute byte-length aggregates on partition statistics - character-length entries
+		// were already folded from their exact partitions above
 		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 			const auto &storage_index = length_storage_indexes[agg_idx];
 			const bool is_min = length_columns[agg_idx].is_min;
+			const auto kind = length_columns[agg_idx].kind;
+			if (kind != LengthFunctionKind::BYTE_LENGTH) {
+				continue;
+			}
 
 			Value agg_result;
-			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, is_min, agg_result)) {
+			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, kind, is_min, agg_result)) {
 				return;
 			}
 			for (idx_t partition_idx = 1; partition_idx < partition_stats.size(); partition_idx++) {
 				Value rhs;
-				if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index, is_min, rhs)) {
+				if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index, kind, is_min, rhs)) {
 					return;
 				}
 				if (is_min ? rhs < agg_result : rhs > agg_result) {

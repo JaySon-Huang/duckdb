@@ -233,11 +233,12 @@ SELECT max(strlen(s)), min(strlen(s)) FROM t WHERE i >= 2048 AND j > 5000
 ----
 100	1
 
-# A shared length() is lifted as well, but counts code points - still not optimized
+# A shared length() is lifted as well - on ASCII-only data character counts equal
+# byte counts, so the lifted entry converts and the aggregates fold
 query II
 EXPLAIN SELECT max(length(s)), min(length(s)) FROM t
 ----
-physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
 
 query II
 SELECT max(length(s)), min(length(s)) FROM t
