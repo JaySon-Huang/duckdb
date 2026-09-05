@@ -174,8 +174,10 @@ bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) 
 	return false;
 }
 
-// Try to resolve the column referenced by strlen(VARCHAR) or octet_length(BLOB)
-bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
+enum class LengthFunctionKind : uint8_t { BYTE_LENGTH, CHARACTER_LENGTH };
+
+// Try to resolve strlen(VARCHAR), octet_length(BLOB), or a VARCHAR character-length function
+bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding, LengthFunctionKind &kind) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
@@ -186,19 +188,31 @@ bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding) {
 	}
 	const auto &fun_name = fun.Function().GetName();
 	const auto arg_type = fun.GetChildren()[0]->GetReturnType().id();
-	// octet_length(BIT) is GetSize()-1; string stats store GetSize()
-	const bool is_byte_length = (fun_name == "strlen" && arg_type == LogicalTypeId::VARCHAR) ||
-	                            (fun_name == "octet_length" && arg_type == LogicalTypeId::BLOB);
-	if (!is_byte_length) {
+	LengthFunctionKind detected_kind;
+	if (fun_name == "strlen" && arg_type == LogicalTypeId::VARCHAR) {
+		detected_kind = LengthFunctionKind::BYTE_LENGTH;
+	} else if (fun_name == "octet_length" && arg_type == LogicalTypeId::BLOB) {
+		// octet_length(BIT) is GetSize()-1; string stats store GetSize()
+		detected_kind = LengthFunctionKind::BYTE_LENGTH;
+	} else if (fun_name == "length" || fun_name == "len" || fun_name == "char_length" ||
+	           fun_name == "character_length") {
+		// character counts are only derivable from string statistics - length() is
+		// also defined for lists and bitstrings
+		if (arg_type != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		detected_kind = LengthFunctionKind::CHARACTER_LENGTH;
+	} else {
 		return false;
 	}
 	binding = fun.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding();
+	kind = detected_kind;
 	return true;
 }
 
-// Extract the exact byte length of a partition from its string statistics
-bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
-                                Value &result) {
+// Extract the exact length of a partition from its string statistics
+bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index,
+                                LengthFunctionKind kind, bool is_min, Value &result) {
 	if (!stats.partition_row_group) {
 		return false;
 	}
@@ -215,6 +229,10 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 	}
 	if (!column_stats->CanHaveNoNull()) {
 		// the partition is entirely NULL - MIN/MAX returns NULL, so we cannot extract a value
+		return false;
+	}
+	if (kind == LengthFunctionKind::CHARACTER_LENGTH && StringStats::CanContainUnicode(*column_stats)) {
+		// character counts only equal byte counts when the partition is ASCII-only
 		return false;
 	}
 	if (is_min) {
@@ -238,6 +256,7 @@ struct LengthColumnInfo {
 	ColumnBinding binding;
 	bool is_min;
 	idx_t aggr_idx;
+	LengthFunctionKind kind;
 };
 
 } // namespace
@@ -280,10 +299,11 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			if (!TryGetMinMaxColumnInfo(*aggr_expr.GetChildren()[0], column_info)) {
 				// min/max over a byte-length function, e.g. MAX(strlen(col))
 				ColumnBinding length_binding;
-				if (!TryGetLengthColumnRef(*aggr_expr.GetChildren()[0], length_binding)) {
+				LengthFunctionKind length_kind;
+				if (!TryGetLengthColumnRef(*aggr_expr.GetChildren()[0], length_binding, length_kind)) {
 					return;
 				}
-				length_columns.push_back({length_binding, is_min, i});
+				length_columns.push_back({length_binding, is_min, i, length_kind});
 				continue;
 			}
 			column_info.is_min = is_min;
@@ -314,7 +334,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				column_info.binding = expr.Cast<BoundColumnRefExpression>().Binding();
 				continue;
 			}
-			if (!TryGetLengthColumnRef(expr, column_info.binding)) {
+			if (!TryGetLengthColumnRef(expr, column_info.binding, column_info.kind)) {
 				return;
 			}
 		}
@@ -328,14 +348,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				// the projection computes a byte length over a column, e.g. a shared
 				// strlen(col) lifted out of the aggregates - convert this entry
 				ColumnBinding length_binding;
-				if (!TryGetLengthColumnRef(expr, length_binding)) {
+				LengthFunctionKind length_kind;
+				if (!TryGetLengthColumnRef(expr, length_binding, length_kind)) {
 					return;
 				}
 				if (column_info.result_type != expr.GetReturnType()) {
 					// the aggregate casts the projected value - not a plain length aggregate
 					return;
 				}
-				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx});
+				length_columns.push_back({length_binding, column_info.is_min, column_info.aggr_idx, length_kind});
 				min_max_columns.erase(min_max_columns.begin() + NumericCast<int64_t>(i - 1));
 				comparators.erase(comparators.begin() + NumericCast<int64_t>(i - 1));
 				continue;
@@ -497,14 +518,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 			const auto &storage_index = length_storage_indexes[agg_idx];
 			const bool is_min = length_columns[agg_idx].is_min;
+			const auto kind = length_columns[agg_idx].kind;
 
 			Value agg_result;
-			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, is_min, agg_result)) {
+			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, kind, is_min, agg_result)) {
 				return;
 			}
 			for (idx_t partition_idx = 1; partition_idx < partition_stats.size(); partition_idx++) {
 				Value rhs;
-				if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index, is_min, rhs)) {
+				if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index, kind, is_min, rhs)) {
 					return;
 				}
 				if (is_min ? rhs < agg_result : rhs > agg_result) {

@@ -1,0 +1,100 @@
+# name: test/optimizer/minmax_char_length.test
+# description: Test folding of MIN/MAX over character-length functions from string statistics
+# group: [optimizer]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+require no_alternative_verify
+
+# has_unicode/has_min_string_length semantics rely on the V2_0_0+ storage format
+statement ok
+SET storage_compatibility_version='latest';
+
+statement ok
+ATTACH '{TEST_DIR}/minmax_char_length.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+# Four ASCII-only row groups, byte length (i % 100) + 1, i.e. 1..100
+statement ok
+CREATE TABLE t_ascii AS (SELECT i, repeat('a', (i % 100) + 1) AS s FROM range(8192) _(i));
+
+# Unicode in every row group: even rows are 'é' plus 0..48 'b's (1..49 characters,
+# 2..50 bytes), odd rows are 'a' plus a digit (2..3 characters)
+statement ok
+CREATE TABLE t_uni AS (SELECT i, CASE WHEN i % 2 = 0 THEN 'é' || repeat('b', i % 50) ELSE 'a' || (i % 10) END AS s FROM range(8192) _(i));
+
+# A list column: length() counts list elements, unrelated to string statistics
+statement ok
+CREATE TABLE t_list AS (SELECT [1, 2, 3] AS l);
+
+# Reopen to clear version info
+statement ok
+ATTACH '{TEST_DIR}/tmp_minmax_char_length.duckdb' AS tmp
+
+statement ok
+USE tmp
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '{TEST_DIR}/minmax_char_length.duckdb' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE db
+
+statement ok
+DETACH tmp
+
+# ASCII-only columns: character counts equal byte counts, so the aggregates fold
+query II
+EXPLAIN SELECT max(length(s)), min(length(s)) FROM t_ascii
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), min(length(s)) FROM t_ascii
+----
+100	1
+
+# Aliases resolve to the same function and fold as well
+query II
+EXPLAIN SELECT max(char_length(s)), min(character_length(s)) FROM t_ascii
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(char_length(s)), min(character_length(s)) FROM t_ascii
+----
+100	1
+
+# length() over a list counts elements - no string statistics, no folding
+query II
+EXPLAIN SELECT max(length(l)) FROM t_list
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+# A unicode-possible column must not fold character lengths - the byte-length
+# variants still fold from the same statistics
+query II
+EXPLAIN SELECT max(char_length(s)), min(char_length(s)) FROM t_uni
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(char_length(s)), min(char_length(s)) FROM t_uni
+----
+49	1
+
+query II
+EXPLAIN SELECT max(strlen(s)), min(strlen(s)) FROM t_uni
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), min(strlen(s)) FROM t_uni
+----
+50	2
