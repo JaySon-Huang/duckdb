@@ -319,8 +319,12 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 	if (!has_char_entries) {
 		return true;
 	}
-	if (has_table_filters) {
-		// composing filter pruning with character-length bound pruning is not supported
+	if (has_table_filters && need_to_scan) {
+		// Residual filter partitions are tracked by original row-group index, while this
+		// function indexes into the already-filtered partition_stats list. Mixing the two
+		// scan lists is not supported. Fully classified filters are safe: remaining
+		// partitions are FILTER_ALWAYS_TRUE, so their stats describe every surviving row
+		// and folding them is the same as folding a smaller unfiltered table.
 		return false;
 	}
 

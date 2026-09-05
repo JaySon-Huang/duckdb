@@ -79,6 +79,18 @@ SELECT max(char_length(s)), min(character_length(s)) FROM t_ascii
 ----
 100	1
 
+# A filter that drops entire row groups leaves only fully-kept ASCII partitions,
+# which still fold - same as max(strlen(s)) WHERE i >= 2048 AND i < 6144
+query II
+EXPLAIN SELECT max(length(s)) FROM t_ascii WHERE i >= 2048 AND i < 6144
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(length(s)) FROM t_ascii WHERE i >= 2048 AND i < 6144
+----
+100
+
 # length() over a list counts elements - no string statistics, no folding
 query II
 EXPLAIN SELECT max(length(l)) FROM t_list
