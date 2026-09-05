@@ -660,9 +660,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
-	if (!TryFoldCharacterLengthAggregates(
-	        get.table_filters.HasFilters(), !min_max_columns.empty() || !count_star_idxs.empty(), length_columns,
-	        length_storage_indexes, partition_stats, agg_results, need_to_scan, scan_partition_indices)) {
+	const bool char_aggregates_folded = TryFoldCharacterLengthAggregates(
+	    get.table_filters.HasFilters(), !min_max_columns.empty() || !count_star_idxs.empty(), length_columns,
+	    length_storage_indexes, partition_stats, agg_results, need_to_scan, scan_partition_indices);
+	if (!char_aggregates_folded && need_to_scan) {
+		// residual table filters change the input of every aggregate - the partition
+		// statistics do not describe the rows the scan will process, nothing can fold
 		return;
 	}
 
@@ -733,6 +736,57 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			agg_results[count_star_idx] =
 			    make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
 		}
+	}
+
+	if (!char_aggregates_folded) {
+		// Character-length aggregates could not be folded from the partition statistics:
+		// keep the aggregate (and its scan) for them and replace every folded aggregate
+		// with a constant in a projection above
+		bool any_folded = false;
+		for (const auto &result : agg_results) {
+			if (result) {
+				any_folded = true;
+				break;
+			}
+		}
+		if (!any_folded) {
+			// the aggregate is unchanged
+			return;
+		}
+		D_ASSERT(!need_to_scan);
+		const auto expression_count = agg_results.size();
+		auto proj_index = optimizer.binder.GenerateTableIndex();
+		vector<unique_ptr<Expression>> proj_expressions(expression_count);
+		vector<unique_ptr<Expression>> kept_aggregates;
+		for (idx_t i = 0; i < expression_count; i++) {
+			auto &aggr_expr = aggr.expressions[i];
+			if (agg_results[i]) {
+				auto constant = std::move(agg_results[i]);
+				constant->SetAlias(aggr_expr->GetAlias());
+				proj_expressions[i] = std::move(constant);
+				continue;
+			}
+			auto col_ref = make_uniq<BoundColumnRefExpression>(
+			    aggr_expr->GetReturnType(),
+			    ColumnBinding(aggr.aggregate_index, ProjectionIndex(kept_aggregates.size())));
+			col_ref->SetAlias(aggr_expr->GetAlias());
+			proj_expressions[i] = std::move(col_ref);
+			kept_aggregates.push_back(std::move(aggr.expressions[i]));
+		}
+		aggr.expressions = std::move(kept_aggregates);
+
+		auto projection = make_uniq<LogicalProjection>(proj_index, std::move(proj_expressions));
+		projection->children.push_back(std::move(node_ptr));
+
+		ColumnBindingReplacer replacer;
+		for (idx_t i = 0; i < expression_count; i++) {
+			replacer.replacement_bindings.emplace_back(ColumnBinding(aggr.aggregate_index, ProjectionIndex(i)),
+			                                           ColumnBinding(proj_index, ProjectionIndex(i)));
+		}
+		replacer.stop_operator = projection.get();
+		node_ptr = std::move(projection);
+		replacer.VisitOperator(*root);
+		return;
 	}
 
 	if (need_to_scan) {
