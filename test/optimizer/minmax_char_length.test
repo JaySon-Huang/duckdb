@@ -154,22 +154,6 @@ SELECT max(strlen(s)) FROM t_mix
 ----
 99
 
-# With a byte-length aggregate in the same query, pruned partitions are scanned
-# instead so the byte aggregate sees all rows - both results merge correctly
-mode skip "This optimization is currently disabled due to issues with rowgroup reordering"
-
-query II
-EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_mix
-----
-physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
-
-mode unskip
-
-query II
-SELECT max(strlen(s)), max(length(s)) FROM t_mix
-----
-99	99
-
 # Four-byte characters (U+20000) cap the character count at a quarter of the byte
 # count - row groups 0-3 below hold 50..64 characters, row group 4 up to 10
 # characters in at most 40 bytes, so its bound cannot hold the global maximum
@@ -210,3 +194,90 @@ query I
 SELECT max(length(s)) FROM t_4byte_scan
 ----
 30
+
+# Both length flavors independently prove the unicode row group cannot hold either
+# maximum - byte bound 12 < 99 and character bound 10 < 99 - so it is pruned for
+# both and the query folds without scanning
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+99	99
+
+# Cross-direction mix: strlen MIN is exact from unicode byte stats (3), while
+# character MAX prunes that row group (12 < 99), so both fold without scanning
+query II
+EXPLAIN SELECT min(strlen(s)), max(length(s)) FROM t_mix
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), max(length(s)) FROM t_mix
+----
+3	99
+
+# Same-direction MIN: unicode holds both minima (byte 3, character bound ceil(3/4)=1
+# below the ASCII candidate 10), so character MIN cannot prune and the query scans
+query II
+EXPLAIN SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+3	1
+
+# Character MIN still cannot prune when the byte side is a maximum
+query II
+EXPLAIN SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+99	1
+
+# Aggregates that need every row keep the unicode row group in the scan set
+query II
+EXPLAIN SELECT max(length(s)), count(*) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), count(*) FROM t_mix
+----
+99	8292
+
+query II
+EXPLAIN SELECT max(length(s)), min(s) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), min(s) FROM t_mix
+----
+99	xxxxxxxxxx
+
+# Strings short enough for exact prefix statistics: min(s) vetoes pruning, so the
+# unicode row group is scanned even though max(length(s)) could fold from ASCII
+statement ok
+CREATE TABLE t_short AS (SELECT 'a' || (i % 10) AS s FROM range(8192) _(i));
+
+statement ok
+INSERT INTO t_short SELECT 'é' || repeat('b', i % 5) FROM range(100) _(i);
+
+query II
+EXPLAIN SELECT max(length(s)), min(s) FROM t_short
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), min(s) FROM t_short
+----
+5	a0
