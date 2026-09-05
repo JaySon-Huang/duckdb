@@ -14,10 +14,11 @@ on:
         default: true
   repository_dispatch:
   merge_group:
-  # fork-only customization: pushes never start this workflow. CI is opt-in per PR via the
-  # `ci-run` label; applying (or re-applying) the label starts one suite on the PR's merge ref.
+  # fork-only customization: pushes never start this workflow. CI runs on a PR only while the
+  # `ci-run` label is applied: applying it starts one suite, every push to the PR re-runs it,
+  # and removing the label silences CI again.
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
 
 
 concurrency:
@@ -40,7 +41,9 @@ jobs:
     if: |
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       (github.event.action != 'synchronize' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) &&
-      (github.event_name != 'pull_request' || github.event.label.name == 'ci-run')
+      (github.event_name != 'pull_request' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'ci-run') ||
+        (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'ci-run')))
     runs-on: ${{ github.repository == 'duckdb/duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
     outputs:
       git_sha: ${{ steps.resolve_git_sha.outputs.git_sha }}
