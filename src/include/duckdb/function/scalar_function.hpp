@@ -55,19 +55,24 @@ struct BindLambdaContext {
 class Binder;
 class BoundFunctionExpression;
 class BoundScalarFunction;
+class ClientContext;
 class ScalarFunctionCatalogEntry;
 
 struct StatementProperties;
 
 struct FunctionStatisticsPruneInput {
 	FunctionStatisticsPruneInput(const BoundFunctionExpression &function_p, optional_ptr<FunctionData> bind_data_p,
-	                             const vector<optional_ptr<const BaseStatistics>> &child_stats_p)
-	    : function(function_p), bind_data(bind_data_p), child_stats(child_stats_p) {
+	                             const vector<optional_ptr<const BaseStatistics>> &child_stats_p,
+	                             optional_ptr<ClientContext> context_p = nullptr)
+	    : function(function_p), bind_data(bind_data_p), context(context_p), child_stats(child_stats_p) {
 	}
 
 	//! The bound function expression being checked (gives access to the argument expressions)
 	const BoundFunctionExpression &function;
 	optional_ptr<FunctionData> bind_data;
+
+	//! The client context (if available) - lets callbacks derive statistics of nested expressions
+	optional_ptr<ClientContext> context;
 
 	//! Statistics for each function argument (an entry is null if it could not be derived for that argument)
 	const vector<optional_ptr<const BaseStatistics>> &child_stats;

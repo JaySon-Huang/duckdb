@@ -1,0 +1,270 @@
+# name: test/sql/topn/topn_dynamic_filter_expression_key.test
+# description: Test Top-N dynamic filter pushdown for expression sort keys (e.g. ORDER BY year(d))
+# group: [topn]
+
+# The Top-N dynamic filter boundary lives in the sort key value domain: the heap boundary is the
+# decoded sort key value of the first order clause. For expression sort keys the pushed filter must
+# therefore evaluate the same expression over the raw scan column. Deterministic expressions over a
+# single column are pushed; anything else (multiple columns, non-deterministic functions, CASE, ...)
+# must bail out. Non-monotone functions push safely but cannot prune row groups (no zonemap
+# derivation), monotone functions prune.
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+require no_alternative_verify
+
+require parquet
+
+require vector_size 2048
+
+statement ok
+SET threads TO 1;
+
+# ordered data: 100 rows per day, so every row group spans ~20 days
+statement ok
+ATTACH '{TEST_DIR}/topn_expr_key.duckdb' AS db (ROW_GROUP_SIZE 2048);
+
+statement ok
+USE db
+
+statement ok
+CREATE TABLE t AS
+SELECT i AS k, DATE '2020-01-01' + ((i // 100)::INTEGER) AS d, i % 1000 AS tie, 's' || ((i % 1000)::VARCHAR) AS s
+FROM range(0, 204800) t(i) ORDER BY i;
+
+# positive: monotone expression key - the dynamic filter is pushed and prunes row groups of later
+# years (row groups 0..18 cover 2020, the rest starts at 2021)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY year(d), d, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*Row Groups Scanned: 1[0-9] / 100.*
+
+query I
+SELECT count(*) FROM t WHERE year(d) > 2020
+----
+168200
+
+# the pushed filter must not change the result
+query I
+SELECT k FROM t ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query I
+SELECT k FROM t ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = '';
+
+# positive: DESC NULLS FIRST with an expression key over a nullable column
+statement ok
+CREATE TABLE tn AS
+SELECT i AS k, CASE WHEN i % 100 = 0 THEN NULL ELSE DATE '2020-01-01' + ((i // 100)::INTEGER) END AS d, i % 1000 AS tie
+FROM range(0, 204800) t(i) ORDER BY i;
+
+query II
+EXPLAIN ANALYZE SELECT d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT count(*) FROM tn WHERE d IS NULL
+----
+2048
+
+query II
+SELECT k, d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie, k LIMIT 2;
+----
+0	NULL
+1000	NULL
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query II
+SELECT k, d FROM tn ORDER BY year(d) DESC NULLS FIRST, d DESC NULLS FIRST, tie, k LIMIT 2;
+----
+0	NULL
+1000	NULL
+
+statement ok
+SET disabled_optimizers = '';
+
+# negative: expression over multiple columns - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY year(d) + k, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# negative: CASE expression - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY CASE WHEN k > 0 THEN 1 ELSE 2 END, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# negative: volatile function - must not push
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY ((k * 9301 + 49297) % 233280) + random()::INT, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# a non-monotone expression key (abs) pushes safely but cannot derive zonemaps - filter is present
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY abs(k - 100000), d LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+# plain column keys keep their dynamic filter (regression guard)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY d, k LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+# parquet: monotone expression key prunes row groups (bare-column equivalence)
+statement ok
+COPY (SELECT * FROM t) TO '{TEST_DIR}/topn_expr_key.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
+
+query II
+EXPLAIN ANALYZE SELECT d FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*Row Groups Scanned: 1[0-9] / 100.*
+
+query I
+SELECT k FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = 'TOP_N';
+
+query I
+SELECT k FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+SET disabled_optimizers = '';
+
+# second-opinion review follow-ups ------------------------------------------------
+# since the order-preserving cast-chain replay machinery (dynamic filters through widening
+# integral casts) is in place, a type-changing cast recorded in between (aggregate GROUP BY
+# CAST(...) / set-op child projection) is replayed on the filter input instead of reinterpreting
+# the constants - the pushdown is now valid. Casts that are not order-preserving (an explicit
+# TRY_CAST, or a cast that can throw) still bail out
+
+# positive: bare sort key through an aggregate GROUP BY CAST(...) - the widening integral cast
+# chain is replayed on the filter input, the result must stay correct
+statement ok
+CREATE TABLE tint AS SELECT i::INTEGER AS k FROM range(0, 204800) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 10;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query II
+SELECT CAST(k AS BIGINT) AS x, count(*) FROM tint GROUP BY CAST(k AS BIGINT) ORDER BY x LIMIT 3;
+----
+0	1
+1	1
+2	1
+
+# positive: casts recorded through set-op child projections are replayed as well
+statement ok
+CREATE TABLE ta AS SELECT i::INTEGER AS k FROM range(0, 100000) t(i);
+
+statement ok
+CREATE TABLE tb AS SELECT (100000 + i)::INTEGER AS k FROM range(100000, 200000) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 5;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM (SELECT CAST(k AS BIGINT) AS k FROM ta UNION ALL SELECT CAST(k AS BIGINT) AS k FROM tb) st ORDER BY k LIMIT 3;
+----
+0
+1
+2
+
+# negative: a TRY_CAST sort key must not push - the cast creates new NULLs (failing inputs rank
+# as NULL), so the dynamic filter would silently drop rows the sort key ranks as NULL
+query II
+EXPLAIN SELECT TRY_CAST(k AS TINYINT) AS x, count(*) FROM tint GROUP BY TRY_CAST(k AS TINYINT) ORDER BY x LIMIT 10;
+----
+physical_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+query II
+SELECT TRY_CAST(k AS TINYINT) AS x, count(*) FROM tint GROUP BY TRY_CAST(k AS TINYINT) ORDER BY x LIMIT 3;
+----
+0	1
+1	1
+2	1
+
+# negative: a VARCHAR cast sort key is not order-preserving ('10' < '2' lexicographically), so
+# the min/max statistics derivation would be unsound - must not push (same criterion as the
+# bare-column cast chains)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY d::VARCHAR, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM t ORDER BY d::VARCHAR, d, k LIMIT 3;
+----
+0
+1
+2
+
+# positive: nested deterministic functions push as well (stats derivation may yield no pruning)
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY length(trim(s)), d LIMIT 100;
+----
+analyzed_plan	<REGEX>:(?s).*Dynamic Filter.*
+
+query I
+SELECT k FROM t ORDER BY length(trim(s)), d, k LIMIT 3;
+----
+0
+1
+2
+
+# negative: a pure constant sort key has no column to push a filter onto
+query II
+EXPLAIN ANALYZE SELECT d FROM t ORDER BY 1 + 1, d LIMIT 100;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic Filter.*
+
+# prepared statement round-trip: the dynamic filter runtime state is not serialized -
+# deserialization must safely degrade to an unfiltered scan with identical results
+statement ok
+PREPARE p_topn_expr AS SELECT d FROM read_parquet('{TEST_DIR}/topn_expr_key.parquet') ORDER BY year(d), d, tie LIMIT 3;
+
+query I
+EXECUTE p_topn_expr;
+----
+2020-01-01
+2020-01-01
+2020-01-01
+
+query I
+EXECUTE p_topn_expr;
+----
+2020-01-01
+2020-01-01
+2020-01-01
