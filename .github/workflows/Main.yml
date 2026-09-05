@@ -12,41 +12,11 @@ on:
       run_all:
         type: boolean
         default: true
-  push:
-    branches-ignore:
-      - 'main'
-      - 'feature'
-      - 'v*.*-*'
-      - 'gh-readonly-queue/**'
-    paths:
-      - '**'
-      - '!**.md'
-      - '!tools/**'
-      - 'tools/shell/**'
-      - '!.github/patches/duckdb-wasm/**'
-      - '!.github/workflows/**'
-      - '.github/workflows/Main.yml'
-      - '.github/workflows/Swift.yml'
-      - '.github/workflows/Windows.yml'
-      - '.github/workflows/Regression.yml'
-      - '.github/workflows/Extensions.yml'
-      - '.github/workflows/OSX.yml'
   merge_group:
+  # fork-only customization: pushes never start this workflow. CI is opt-in per PR via the
+  # `ci-run` label; applying (or re-applying) the label starts one suite on the PR's merge ref.
   pull_request:
-    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize]
-    paths:
-      - '**'
-      - '!**.md'
-      - '!tools/**'
-      - 'tools/shell/**'
-      - '!.github/patches/duckdb-wasm/**'
-      - '!.github/workflows/**'
-      - '.github/workflows/Main.yml'
-      - '.github/workflows/Swift.yml'
-      - '.github/workflows/Windows.yml'
-      - '.github/workflows/Regression.yml'
-      - '.github/workflows/Extensions.yml'
-      - '.github/workflows/OSX.yml'
+    types: [labeled]
 
 
 concurrency:
@@ -68,7 +38,8 @@ jobs:
     # We run all other jobs on PRs only if they are not draft PR
     if: |
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
-      (github.event.action != 'synchronize' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      (github.event.action != 'synchronize' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) &&
+      (github.event_name != 'pull_request' || github.event.label.name == 'ci-run')
     runs-on: ${{ github.repository == 'duckdb/duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
     outputs:
       duckdb_commit: ${{ steps.version.outputs.duckdb_commit }}
