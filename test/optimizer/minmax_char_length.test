@@ -208,17 +208,40 @@ SELECT max(strlen(s)), max(length(s)) FROM t_mix
 ----
 99	99
 
-# Cross-direction mix: the unicode row group holds the smallest byte length (3 < 10),
-# so the strlen MIN vote outvotes the character MAX prune - it must be scanned
+# Cross-direction mix: strlen MIN is exact from unicode byte stats (3), while
+# character MAX prunes that row group (12 < 99), so both fold without scanning
 query II
 EXPLAIN SELECT min(strlen(s)), max(length(s)) FROM t_mix
 ----
-physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
 
 query II
 SELECT min(strlen(s)), max(length(s)) FROM t_mix
 ----
 3	99
+
+# Same-direction MIN: unicode holds both minima (byte 3, character bound ceil(3/4)=1
+# below the ASCII candidate 10), so character MIN cannot prune and the query scans
+query II
+EXPLAIN SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+3	1
+
+# Character MIN still cannot prune when the byte side is a maximum
+query II
+EXPLAIN SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+99	1
 
 # Aggregates that need every row keep the unicode row group in the scan set
 query II

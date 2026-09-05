@@ -328,7 +328,7 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 	vector<bool> unicode_possible(partition_stats.size(), false);
 	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 		auto &entry = length_columns[agg_idx];
-		// byte-length aggregates vote below with raw byte bounds
+		// byte-length aggregates are folded from exact stats below
 		if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
 			continue;
 		}
@@ -375,8 +375,9 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 		}
 	}
 
-	// Byte-length entries vote with the raw byte bounds: a partition whose bytes are
-	// strictly worse than the global extreme cannot affect them either.
+	// Byte-length entries fold from exact min/max over every partition, including
+	// unicode-possible ones. Those stats are already the real strlen/octet_length
+	// extreme, so they never force a scan; character bounds and other aggregates do.
 	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 		auto &entry = length_columns[agg_idx];
 		if (entry.kind != LengthFunctionKind::BYTE_LENGTH) {
@@ -385,14 +386,12 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 		const auto &storage_index = length_storage_indexes[agg_idx];
 
 		optional<Value> candidate;
-		vector<Value> raw_bounds(partition_stats.size());
 		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
 			Value value;
 			if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index,
 			                               LengthFunctionKind::BYTE_LENGTH, entry.is_min, value)) {
 				return false;
 			}
-			raw_bounds[partition_idx] = value;
 			if (!candidate.has_value() || (entry.is_min ? value < *candidate : value > *candidate)) {
 				candidate = std::move(value);
 			}
@@ -400,16 +399,7 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 		if (!candidate.has_value()) {
 			return false;
 		}
-		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
-			if (!unicode_possible[partition_idx]) {
-				continue;
-			}
-			const bool skippable =
-			    entry.is_min ? raw_bounds[partition_idx] > *candidate : raw_bounds[partition_idx] < *candidate;
-			if (!skippable) {
-				needs_scan[partition_idx] = true;
-			}
-		}
+		agg_results[entry.aggr_idx] = make_uniq<BoundConstantExpression>(*candidate);
 	}
 
 	// Aggregates outside the length family (count_star, plain column min/max) need
@@ -701,13 +691,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 	if (!length_columns.empty()) {
-		// Execute byte-length aggregates on partition statistics - character-length entries
-		// were already folded from their exact partitions above
+		// Execute byte-length aggregates on remaining partition statistics. Skip entries
+		// already folded above so an ASCII-only remainder cannot overwrite a global
+		// extreme that lived on a pruned unicode partition.
 		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 			const auto &storage_index = length_storage_indexes[agg_idx];
 			const bool is_min = length_columns[agg_idx].is_min;
 			const auto kind = length_columns[agg_idx].kind;
-			if (kind != LengthFunctionKind::BYTE_LENGTH) {
+			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
+			if (kind != LengthFunctionKind::BYTE_LENGTH || agg_results[aggr_idx]) {
 				continue;
 			}
 
@@ -724,7 +716,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 					agg_result = rhs;
 				}
 			}
-			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
 			agg_results[aggr_idx] = make_uniq<BoundConstantExpression>(agg_result);
 		}
 	}
