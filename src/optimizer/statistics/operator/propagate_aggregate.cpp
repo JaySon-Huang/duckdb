@@ -277,9 +277,8 @@ bool TryGetCharLengthValueFromStats(const PartitionStatistics &stats, const Stor
 		if (!min_length.IsValid()) {
 			return false;
 		}
-		const auto min_bytes = min_length.GetIndex();
-		result =
-		    Value::BIGINT(ascii_only ? NumericCast<int64_t>(min_bytes) : NumericCast<int64_t>((min_bytes + 3) / 4));
+		const auto min_bytes = NumericCast<int64_t>(min_length.GetIndex());
+		result = Value::BIGINT(ascii_only ? min_bytes : (min_bytes + 3) / 4);
 	} else {
 		if (!StringStats::HasMaxStringLength(*column_stats)) {
 			return false;
@@ -308,12 +307,9 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
                                       vector<unique_ptr<Expression>> &agg_results, bool &need_to_scan,
                                       vector<idx_t> &scan_partition_indices) {
 	bool has_char_entries = false;
-	bool char_only = !has_other_aggregates;
 	for (const auto &entry : length_columns) {
 		if (entry.kind == LengthFunctionKind::CHARACTER_LENGTH) {
 			has_char_entries = true;
-		} else {
-			char_only = false;
 		}
 	}
 	if (!has_char_entries) {
@@ -332,7 +328,7 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 	vector<bool> unicode_possible(partition_stats.size(), false);
 	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 		auto &entry = length_columns[agg_idx];
-		// byte-length aggregates are handled outside of this function
+		// byte-length aggregates are folded from exact stats below
 		if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
 			continue;
 		}
@@ -379,13 +375,43 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 		}
 	}
 
-	// Pruned partitions can only be dropped when every aggregate is a character-length
-	// entry; mixed queries still need these rows. Same-direction mixes can vote to
-	// prune together - left as a follow-up.
-	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
-		if (unicode_possible[partition_idx] && !needs_scan[partition_idx] && !char_only) {
-			needs_scan[partition_idx] = true;
+	// Byte-length entries fold from exact min/max over every partition, including
+	// unicode-possible ones. Those stats are already the real strlen/octet_length
+	// extreme, so they never force a scan; character bounds and other aggregates do.
+	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
+		auto &entry = length_columns[agg_idx];
+		if (entry.kind != LengthFunctionKind::BYTE_LENGTH) {
+			continue;
 		}
+		const auto &storage_index = length_storage_indexes[agg_idx];
+
+		optional<Value> candidate;
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			Value value;
+			if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index,
+			                               LengthFunctionKind::BYTE_LENGTH, entry.is_min, value)) {
+				return false;
+			}
+			if (!candidate.has_value() || (entry.is_min ? value < *candidate : value > *candidate)) {
+				candidate = std::move(value);
+			}
+		}
+		if (!candidate.has_value()) {
+			return false;
+		}
+		agg_results[entry.aggr_idx] = make_uniq<BoundConstantExpression>(*candidate);
+	}
+
+	// Aggregates outside the length family (count_star, plain column min/max) need
+	// every partition's rows and veto pruning entirely.
+	if (has_other_aggregates) {
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (unicode_possible[partition_idx]) {
+				needs_scan[partition_idx] = true;
+			}
+		}
+	}
+	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
 		if (needs_scan[partition_idx]) {
 			need_to_scan = true;
 			scan_partition_indices.push_back(partition_idx);
@@ -634,9 +660,12 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
-	if (!TryFoldCharacterLengthAggregates(
-	        get.table_filters.HasFilters(), !min_max_columns.empty() || !count_star_idxs.empty(), length_columns,
-	        length_storage_indexes, partition_stats, agg_results, need_to_scan, scan_partition_indices)) {
+	const bool char_aggregates_folded = TryFoldCharacterLengthAggregates(
+	    get.table_filters.HasFilters(), !min_max_columns.empty() || !count_star_idxs.empty(), length_columns,
+	    length_storage_indexes, partition_stats, agg_results, need_to_scan, scan_partition_indices);
+	if (!char_aggregates_folded && need_to_scan) {
+		// residual table filters change the input of every aggregate - the partition
+		// statistics do not describe the rows the scan will process, nothing can fold
 		return;
 	}
 
@@ -665,13 +694,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 	if (!length_columns.empty()) {
-		// Execute byte-length aggregates on partition statistics - character-length entries
-		// were already folded from their exact partitions above
+		// Execute byte-length aggregates on remaining partition statistics. Skip entries
+		// already folded above so an ASCII-only remainder cannot overwrite a global
+		// extreme that lived on a pruned unicode partition.
 		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 			const auto &storage_index = length_storage_indexes[agg_idx];
 			const bool is_min = length_columns[agg_idx].is_min;
 			const auto kind = length_columns[agg_idx].kind;
-			if (kind != LengthFunctionKind::BYTE_LENGTH) {
+			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
+			if (kind != LengthFunctionKind::BYTE_LENGTH || agg_results[aggr_idx]) {
 				continue;
 			}
 
@@ -688,7 +719,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 					agg_result = rhs;
 				}
 			}
-			const auto aggr_idx = length_columns[agg_idx].aggr_idx;
 			agg_results[aggr_idx] = make_uniq<BoundConstantExpression>(agg_result);
 		}
 	}
@@ -706,6 +736,57 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			agg_results[count_star_idx] =
 			    make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
 		}
+	}
+
+	if (!char_aggregates_folded) {
+		// Character-length aggregates could not be folded from the partition statistics:
+		// keep the aggregate (and its scan) for them and replace every folded aggregate
+		// with a constant in a projection above
+		bool any_folded = false;
+		for (const auto &result : agg_results) {
+			if (result) {
+				any_folded = true;
+				break;
+			}
+		}
+		if (!any_folded) {
+			// the aggregate is unchanged
+			return;
+		}
+		D_ASSERT(!need_to_scan);
+		const auto expression_count = agg_results.size();
+		auto proj_index = optimizer.binder.GenerateTableIndex();
+		vector<unique_ptr<Expression>> proj_expressions(expression_count);
+		vector<unique_ptr<Expression>> kept_aggregates;
+		for (idx_t i = 0; i < expression_count; i++) {
+			auto &aggr_expr = aggr.expressions[i];
+			if (agg_results[i]) {
+				auto constant = std::move(agg_results[i]);
+				constant->SetAlias(aggr_expr->GetAlias());
+				proj_expressions[i] = std::move(constant);
+				continue;
+			}
+			auto col_ref = make_uniq<BoundColumnRefExpression>(
+			    aggr_expr->GetReturnType(),
+			    ColumnBinding(aggr.aggregate_index, ProjectionIndex(kept_aggregates.size())));
+			col_ref->SetAlias(aggr_expr->GetAlias());
+			proj_expressions[i] = std::move(col_ref);
+			kept_aggregates.push_back(std::move(aggr.expressions[i]));
+		}
+		aggr.expressions = std::move(kept_aggregates);
+
+		auto projection = make_uniq<LogicalProjection>(proj_index, std::move(proj_expressions));
+		projection->children.push_back(std::move(node_ptr));
+
+		ColumnBindingReplacer replacer;
+		for (idx_t i = 0; i < expression_count; i++) {
+			replacer.replacement_bindings.emplace_back(ColumnBinding(aggr.aggregate_index, ProjectionIndex(i)),
+			                                           ColumnBinding(proj_index, ProjectionIndex(i)));
+		}
+		replacer.stop_operator = projection.get();
+		node_ptr = std::move(projection);
+		replacer.VisitOperator(*root);
+		return;
 	}
 
 	if (need_to_scan) {

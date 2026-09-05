@@ -154,22 +154,6 @@ SELECT max(strlen(s)) FROM t_mix
 ----
 99
 
-# With a byte-length aggregate in the same query, pruned partitions are scanned
-# instead so the byte aggregate sees all rows - both results merge correctly
-mode skip "This optimization is currently disabled due to issues with rowgroup reordering"
-
-query II
-EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_mix
-----
-physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
-
-mode unskip
-
-query II
-SELECT max(strlen(s)), max(length(s)) FROM t_mix
-----
-99	99
-
 # Four-byte characters (U+20000) cap the character count at a quarter of the byte
 # count - row groups 0-3 below hold 50..64 characters, row group 4 up to 10
 # characters in at most 40 bytes, so its bound cannot hold the global maximum
@@ -210,3 +194,185 @@ query I
 SELECT max(length(s)) FROM t_4byte_scan
 ----
 30
+
+# Both length flavors independently prove the unicode row group cannot hold either
+# maximum - byte bound 12 < 99 and character bound 10 < 99 - so it is pruned for
+# both and the query folds without scanning
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+99	99
+
+# Cross-direction mix: strlen MIN is exact from unicode byte stats (3), while
+# character MAX prunes that row group (12 < 99), so both fold without scanning
+query II
+EXPLAIN SELECT min(strlen(s)), max(length(s)) FROM t_mix
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), max(length(s)) FROM t_mix
+----
+3	99
+
+# Same-direction MIN: unicode holds both minima (byte 3, character bound ceil(3/4)=1
+# below the ASCII candidate 10), so character MIN cannot prune and the query scans
+query II
+EXPLAIN SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), min(length(s)) FROM t_mix
+----
+3	1
+
+# Character MIN still cannot prune when the byte side is a maximum
+query II
+EXPLAIN SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), min(length(s)) FROM t_mix
+----
+99	1
+
+# Aggregates that need every row keep the unicode row group in the scan set
+query II
+EXPLAIN SELECT max(length(s)), count(*) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), count(*) FROM t_mix
+----
+99	8292
+
+query II
+EXPLAIN SELECT max(length(s)), min(s) FROM t_mix
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), min(s) FROM t_mix
+----
+99	xxxxxxxxxx
+
+# Strings short enough for exact prefix statistics: min(s) vetoes pruning, so the
+# unicode row group is scanned even though max(length(s)) could fold from ASCII
+statement ok
+CREATE TABLE t_short AS (SELECT 'a' || (i % 10) AS s FROM range(8192) _(i));
+
+statement ok
+INSERT INTO t_short SELECT 'é' || repeat('b', i % 5) FROM range(100) _(i);
+
+query II
+EXPLAIN SELECT max(length(s)), min(s) FROM t_short
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(length(s)), min(s) FROM t_short
+----
+5	a0
+
+# Every row group of t_uni_split contains unicode with separated length ranges,
+# so the byte-length extremes are exact from statistics while no partition is
+# ASCII-only and the character-length extremes cannot fold:
+# row group 0: 300..309 characters (900..927 bytes), row group 1: 310..319
+# characters (930..957 bytes), row group 2: 100..109 characters (300..327
+# bytes), row group 3: 110..119 characters (330..357 bytes)
+statement ok
+CREATE TABLE t_uni_split AS (SELECT i, CASE WHEN i < 4096 THEN repeat('中', 300 + 10 * (i // 2048) + (i % 10)) ELSE repeat('中', 100 + 10 * ((i - 4096) // 2048) + (i % 10)) END AS s FROM range(8192) _(i));
+
+# Mixed byte + character maximums on an all-unicode table: strlen folds to a
+# constant from statistics while length keeps its aggregate and full scan
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_uni_split
+----
+physical_plan	<REGEX>:.*957.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_uni_split
+----
+957	319
+
+# A residual filter (neither always-true nor always-false for some row groups)
+# changes the input of every aggregate - no aggregate may fold, the values must
+# come from scanning the filtered rows. Row group 2 is the only fully-kept one
+# (100..109 characters, 300..327 bytes), which must not leak into the results
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_uni_split WHERE i > 2500 AND i < 7000
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_uni_split WHERE i > 2500 AND i < 7000
+----
+physical_plan	<!REGEX>:.*327.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_uni_split WHERE i > 2500 AND i < 7000
+----
+957	319
+
+# A filter that drops row groups 0 and 1 entirely leaves only fully-kept
+# partitions, whose statistics describe every surviving row - strlen folds to
+# the maximum of the surviving partitions while length keeps scanning
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_uni_split WHERE i >= 4096
+----
+physical_plan	<REGEX>:.*357.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_uni_split WHERE i >= 4096
+----
+357	119
+
+# Cross-direction mix on the same table: the byte minimum folds, the character
+# maximum keeps scanning
+query II
+EXPLAIN SELECT min(strlen(s)), max(length(s)) FROM t_uni_split
+----
+physical_plan	<REGEX>:.*300.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(strlen(s)), max(length(s)) FROM t_uni_split
+----
+300	319
+
+# count(*) folds from the partition counts while the character maximum keeps
+# scanning - the constant projection sits above the aggregate
+query II
+EXPLAIN SELECT count(*), max(length(s)) FROM t_uni_split
+----
+physical_plan	<REGEX>:.*8192.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT count(*), max(length(s)) FROM t_uni_split
+----
+8192	319
+
+# Uncheckpointed appends carry version info - the row group statistics are not
+# exact, so nothing folds
+statement ok
+CREATE TABLE t_uni_pending (s VARCHAR)
+
+statement ok
+INSERT INTO t_uni_pending SELECT repeat('中', 100 + (i % 20)) FROM range(8192) _(i)
+
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_uni_pending
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_uni_pending
+----
+357	119
