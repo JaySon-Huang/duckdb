@@ -277,9 +277,8 @@ bool TryGetCharLengthValueFromStats(const PartitionStatistics &stats, const Stor
 		if (!min_length.IsValid()) {
 			return false;
 		}
-		const auto min_bytes = min_length.GetIndex();
-		result =
-		    Value::BIGINT(ascii_only ? NumericCast<int64_t>(min_bytes) : NumericCast<int64_t>((min_bytes + 3) / 4));
+		const auto min_bytes = NumericCast<int64_t>(min_length.GetIndex());
+		result = Value::BIGINT(ascii_only ? min_bytes : (min_bytes + 3) / 4);
 	} else {
 		if (!StringStats::HasMaxStringLength(*column_stats)) {
 			return false;
@@ -308,12 +307,9 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
                                       vector<unique_ptr<Expression>> &agg_results, bool &need_to_scan,
                                       vector<idx_t> &scan_partition_indices) {
 	bool has_char_entries = false;
-	bool char_only = !has_other_aggregates;
 	for (const auto &entry : length_columns) {
 		if (entry.kind == LengthFunctionKind::CHARACTER_LENGTH) {
 			has_char_entries = true;
-		} else {
-			char_only = false;
 		}
 	}
 	if (!has_char_entries) {
@@ -332,7 +328,7 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 	vector<bool> unicode_possible(partition_stats.size(), false);
 	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 		auto &entry = length_columns[agg_idx];
-		// byte-length aggregates are handled outside of this function
+		// byte-length aggregates vote below with raw byte bounds
 		if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
 			continue;
 		}
@@ -379,13 +375,53 @@ bool TryFoldCharacterLengthAggregates(bool has_table_filters, bool has_other_agg
 		}
 	}
 
-	// Pruned partitions can only be dropped when every aggregate is a character-length
-	// entry; mixed queries still need these rows. Same-direction mixes can vote to
-	// prune together - left as a follow-up.
-	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
-		if (unicode_possible[partition_idx] && !needs_scan[partition_idx] && !char_only) {
-			needs_scan[partition_idx] = true;
+	// Byte-length entries vote with the raw byte bounds: a partition whose bytes are
+	// strictly worse than the global extreme cannot affect them either.
+	for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
+		auto &entry = length_columns[agg_idx];
+		if (entry.kind != LengthFunctionKind::BYTE_LENGTH) {
+			continue;
 		}
+		const auto &storage_index = length_storage_indexes[agg_idx];
+
+		optional<Value> candidate;
+		vector<Value> raw_bounds(partition_stats.size());
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			Value value;
+			if (!TryGetLengthValueFromStats(partition_stats[partition_idx], storage_index,
+			                               LengthFunctionKind::BYTE_LENGTH, entry.is_min, value)) {
+				return false;
+			}
+			raw_bounds[partition_idx] = value;
+			if (!candidate.has_value() || (entry.is_min ? value < *candidate : value > *candidate)) {
+				candidate = std::move(value);
+			}
+		}
+		if (!candidate.has_value()) {
+			return false;
+		}
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (!unicode_possible[partition_idx]) {
+				continue;
+			}
+			const bool skippable =
+			    entry.is_min ? raw_bounds[partition_idx] > *candidate : raw_bounds[partition_idx] < *candidate;
+			if (!skippable) {
+				needs_scan[partition_idx] = true;
+			}
+		}
+	}
+
+	// Aggregates outside the length family (count_star, plain column min/max) need
+	// every partition's rows and veto pruning entirely.
+	if (has_other_aggregates) {
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (unicode_possible[partition_idx]) {
+				needs_scan[partition_idx] = true;
+			}
+		}
+	}
+	for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
 		if (needs_scan[partition_idx]) {
 			need_to_scan = true;
 			scan_partition_indices.push_back(partition_idx);
