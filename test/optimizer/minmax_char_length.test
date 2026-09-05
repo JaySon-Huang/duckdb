@@ -26,6 +26,14 @@ CREATE TABLE t_ascii AS (SELECT i, repeat('a', (i % 100) + 1) AS s FROM range(81
 statement ok
 CREATE TABLE t_uni AS (SELECT i, CASE WHEN i % 2 = 0 THEN 'é' || repeat('b', i % 50) ELSE 'a' || (i % 10) END AS s FROM range(8192) _(i));
 
+# Row groups 0-3 are ASCII-only with lengths 10..99, row group 4 (100 rows) contains
+# unicode strings '日' plus 0..9 'y's (1..10 characters, 3..12 bytes)
+statement ok
+CREATE TABLE t_mix AS (SELECT repeat('x', (i % 90) + 10) AS s FROM range(8192) _(i));
+
+statement ok
+INSERT INTO t_mix SELECT '日' || repeat('y', i % 10) FROM range(100) _(i);
+
 # A list column: length() counts list elements, unrelated to string statistics
 statement ok
 CREATE TABLE t_list AS (SELECT [1, 2, 3] AS l);
@@ -98,3 +106,95 @@ query II
 SELECT max(strlen(s)), min(strlen(s)) FROM t_uni
 ----
 50	2
+
+# Mixed table, MAX: the unicode row group holds at most 12 bytes, below the exact
+# candidate 99 from the ASCII row groups, so it is pruned and the aggregate folds
+query II
+EXPLAIN SELECT max(length(s)) FROM t_mix
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(length(s)) FROM t_mix
+----
+99
+
+# Mixed table, MIN: the unicode row group can hold a character count as low as
+# ceil(3 / 4) = 1, below the exact candidate 10, so it must be scanned and the
+# result merges the constant with the scan through a partial precompute
+mode skip "This optimization is currently disabled due to issues with rowgroup reordering"
+
+query II
+EXPLAIN SELECT min(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*COALESCE.*least.*UNGROUPED_AGGREGATE.*
+
+mode unskip
+
+query I
+SELECT min(length(s)) FROM t_mix
+----
+1
+
+# The byte-length variant on the same table keeps folding without scanning
+query I
+SELECT max(strlen(s)) FROM t_mix
+----
+99
+
+# With a byte-length aggregate in the same query, pruned partitions are scanned
+# instead so the byte aggregate sees all rows - both results merge correctly
+mode skip "This optimization is currently disabled due to issues with rowgroup reordering"
+
+query II
+EXPLAIN SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+mode unskip
+
+query II
+SELECT max(strlen(s)), max(length(s)) FROM t_mix
+----
+99	99
+
+# Four-byte characters (U+20000) cap the character count at a quarter of the byte
+# count - row groups 0-3 below hold 50..64 characters, row group 4 up to 10
+# characters in at most 40 bytes, so its bound cannot hold the global maximum
+statement ok
+CREATE TABLE t_4byte_skip AS (SELECT repeat('x', 50 + (i % 15)) AS s FROM range(8192) _(i));
+
+statement ok
+INSERT INTO t_4byte_skip SELECT repeat('𠀀', 10 - (i % 10)) FROM range(100) _(i);
+
+query II
+EXPLAIN SELECT max(length(s)) FROM t_4byte_skip
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(length(s)) FROM t_4byte_skip
+----
+64
+
+# With shorter ASCII row groups (15..30) the same unicode row group can still hold
+# up to 40 characters by its byte bound - MAX must not prune it and merges instead
+statement ok
+CREATE TABLE t_4byte_scan AS (SELECT repeat('x', 30 - (i % 16)) AS s FROM range(8192) _(i));
+
+statement ok
+INSERT INTO t_4byte_scan SELECT repeat('𠀀', 10 - (i % 10)) FROM range(100) _(i);
+
+mode skip "This optimization is currently disabled due to issues with rowgroup reordering"
+
+query II
+EXPLAIN SELECT max(length(s)) FROM t_4byte_scan
+----
+physical_plan	<REGEX>:.*COALESCE.*greatest.*UNGROUPED_AGGREGATE.*
+
+mode unskip
+
+query I
+SELECT max(length(s)) FROM t_4byte_scan
+----
+30

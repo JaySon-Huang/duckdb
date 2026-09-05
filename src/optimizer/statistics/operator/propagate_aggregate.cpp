@@ -210,25 +210,33 @@ bool TryGetLengthColumnRef(const Expression &expr, ColumnBinding &binding, Lengt
 	return true;
 }
 
-// Extract the exact length of a partition from its string statistics
-bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index,
-                                LengthFunctionKind kind, bool is_min, Value &result) {
+// Fetch the string statistics of a partition, after the shared validity guards
+unique_ptr<BaseStatistics> GetStringColumnStats(const PartitionStatistics &stats, const StorageIndex &storage_index) {
 	if (!stats.partition_row_group) {
-		return false;
+		return nullptr;
 	}
 	auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
 	if (!column_stats) {
-		return false;
+		return nullptr;
 	}
 	if (!stats.partition_row_group->MinMaxIsExact(storage_index) || stats.partition_row_group->HasPendingWrites()) {
-		return false;
+		return nullptr;
 	}
 	if (column_stats->GetStatsType() != StatisticsType::STRING_STATS) {
-		// no length statistics available for this type
-		return false;
+		return nullptr;
 	}
 	if (!column_stats->CanHaveNoNull()) {
 		// the partition is entirely NULL - MIN/MAX returns NULL, so we cannot extract a value
+		return nullptr;
+	}
+	return column_stats;
+}
+
+// Extract the exact length of a partition from its string statistics
+bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index,
+                                LengthFunctionKind kind, bool is_min, Value &result) {
+	auto column_stats = GetStringColumnStats(stats, storage_index);
+	if (!column_stats) {
 		return false;
 	}
 	if (kind == LengthFunctionKind::CHARACTER_LENGTH && StringStats::CanContainUnicode(*column_stats)) {
@@ -246,6 +254,32 @@ bool TryGetLengthValueFromStats(const PartitionStatistics &stats, const StorageI
 			return false;
 		}
 		result = Value::BIGINT(NumericCast<int64_t>(StringStats::MaxStringLength(*column_stats)));
+	}
+	return true;
+}
+
+// Extract the character-length statistic of a partition: the exact value when the
+// partition is ASCII-only, otherwise the safe bound derived from its byte lengths
+// (characters never exceed bytes, and each character needs at most four bytes)
+bool TryGetCharLengthValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index, bool is_min,
+                                    bool &exact, Value &value) {
+	auto column_stats = GetStringColumnStats(stats, storage_index);
+	if (!column_stats) {
+		return false;
+	}
+	exact = !StringStats::CanContainUnicode(*column_stats);
+	if (is_min) {
+		auto min_length = StringStats::MinStringLength(*column_stats);
+		if (!min_length.IsValid()) {
+			return false;
+		}
+		const auto min_bytes = min_length.GetIndex();
+		value = Value::BIGINT(exact ? NumericCast<int64_t>(min_bytes) : NumericCast<int64_t>((min_bytes + 3) / 4));
+	} else {
+		if (!StringStats::HasMaxStringLength(*column_stats)) {
+			return false;
+		}
+		value = Value::BIGINT(NumericCast<int64_t>(StringStats::MaxStringLength(*column_stats)));
 	}
 	return true;
 }
@@ -489,6 +523,103 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
+	// Character-length entries fold from the exact statistics of ASCII-only partitions and
+	// prune unicode-possible partitions whose byte-length bounds exclude the global extreme
+	bool has_char_entries = false;
+	for (const auto &entry : length_columns) {
+		has_char_entries |= entry.kind == LengthFunctionKind::CHARACTER_LENGTH;
+	}
+	if (has_char_entries) {
+		if (get.table_filters.HasFilters()) {
+			// composing filter pruning with character-length bound pruning is not supported
+			return;
+		}
+		bool char_only = min_max_columns.empty() && count_star_idxs.empty();
+		if (char_only) {
+			for (const auto &entry : length_columns) {
+				if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
+					char_only = false;
+					break;
+				}
+			}
+		}
+
+		vector<bool> needs_scan(partition_stats.size(), false);
+		vector<bool> unicode_possible(partition_stats.size(), false);
+		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
+			auto &entry = length_columns[agg_idx];
+			if (entry.kind != LengthFunctionKind::CHARACTER_LENGTH) {
+				continue;
+			}
+			const auto &storage_index = length_storage_indexes[agg_idx];
+
+			// candidate from the exact partitions
+			Value candidate;
+			bool have_candidate = false;
+			vector<bool> is_exact(partition_stats.size(), false);
+			vector<Value> bounds(partition_stats.size());
+			for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+				bool exact;
+				Value value;
+				if (!TryGetCharLengthValueFromStats(partition_stats[partition_idx], storage_index, entry.is_min, exact,
+				                                    value)) {
+					return;
+				}
+				is_exact[partition_idx] = exact;
+				if (!exact) {
+					unicode_possible[partition_idx] = true;
+					bounds[partition_idx] = std::move(value);
+					continue;
+				}
+				if (!have_candidate) {
+					candidate = std::move(value);
+					have_candidate = true;
+				} else if (entry.is_min ? value < candidate : value > candidate) {
+					candidate = std::move(value);
+				}
+			}
+			if (!have_candidate) {
+				// every partition might contain unicode - nothing to fold against
+				return;
+			}
+			agg_results[entry.aggr_idx] = make_uniq<BoundConstantExpression>(std::move(candidate));
+
+			// classify the unicode-possible partitions against the candidate
+			for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+				if (is_exact[partition_idx]) {
+					continue;
+				}
+				const bool skippable =
+				    entry.is_min ? bounds[partition_idx] > candidate : bounds[partition_idx] < candidate;
+				if (!skippable) {
+					needs_scan[partition_idx] = true;
+				}
+			}
+		}
+
+		// pruned partitions can only be dropped when every aggregate is a character-length
+		// entry - otherwise their rows are still needed by the remaining aggregates
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (unicode_possible[partition_idx] && !needs_scan[partition_idx] && !char_only) {
+				needs_scan[partition_idx] = true;
+			}
+			if (needs_scan[partition_idx]) {
+				need_to_scan = true;
+				scan_partition_indices.push_back(partition_idx);
+			}
+		}
+
+		// scanned partitions are merged back through the partial precompute, pruned ones
+		// are proven irrelevant and removed
+		vector<PartitionStatistics> kept_partitions;
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			if (!needs_scan[partition_idx] && !unicode_possible[partition_idx]) {
+				kept_partitions.push_back(std::move(partition_stats[partition_idx]));
+			}
+		}
+		partition_stats = std::move(kept_partitions);
+	}
+
 	if (!min_max_columns.empty()) {
 		// Execute min/max aggregates on partition statistics
 		for (idx_t agg_idx = 0; agg_idx < min_max_storage_indexes.size(); agg_idx++) {
@@ -514,11 +645,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 	if (!length_columns.empty()) {
-		// Execute byte-length aggregates on partition statistics
+		// Execute byte-length aggregates on partition statistics - character-length entries
+		// were already folded from their exact partitions above
 		for (idx_t agg_idx = 0; agg_idx < length_storage_indexes.size(); agg_idx++) {
 			const auto &storage_index = length_storage_indexes[agg_idx];
 			const bool is_min = length_columns[agg_idx].is_min;
 			const auto kind = length_columns[agg_idx].kind;
+			if (kind != LengthFunctionKind::BYTE_LENGTH) {
+				continue;
+			}
 
 			Value agg_result;
 			if (!TryGetLengthValueFromStats(partition_stats[0], storage_index, kind, is_min, agg_result)) {
