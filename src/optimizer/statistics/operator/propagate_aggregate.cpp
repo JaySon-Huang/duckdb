@@ -1,6 +1,7 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/enums/filter_propagate_result.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/types.hpp"
@@ -9,7 +10,6 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -22,7 +22,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_index.hpp"
@@ -30,6 +29,70 @@
 namespace duckdb {
 
 namespace {
+
+//! Classification of one partition's statistics for one aggregate.
+enum class FoldPartitionState : uint8_t {
+	//! The statistics are exact and produced a usable value - the only foldable outcome
+	EXACT_VALUE,
+	//! The statistics bound every surviving row of the partition, but are not exact: good enough to
+	//! vote with, never good enough to fold
+	BOUND,
+	//! The statistics are exact, but the partition contributes no value for this aggregate (e.g. a
+	//! partition holding only NULL values, ignored by MIN/MAX)
+	NEUTRAL,
+	//! No reliable state at all: the statistics do not describe the rows that will be read
+	NO_INFO
+};
+
+//! One partition over which aggregates may be folded: its statistics plus where it came from.
+struct FoldPartition {
+	FoldPartition() = default;
+	FoldPartition(PartitionStatistics stats_p, idx_t original_index_p, FilterPropagateResult filter_result_p)
+	    : stats(std::move(stats_p)), original_index(original_index_p), filter_result(filter_result_p) {
+	}
+
+	PartitionStatistics stats;
+	//! The index of this partition in the row-group list, shared by filter classification and folding
+	idx_t original_index;
+	//! Verdict of the table filters over the whole partition
+	FilterPropagateResult filter_result;
+};
+
+//! Fold one aggregate over the partitions with the compile-time client policy `Client`. A policy
+//! provides ClassifyPartition, CombineCandidate and FallbackValue; using a template keeps the
+//! per-aggregate families free of virtual dispatch and per-aggregate allocations. Returns false
+//! when the statistics cannot answer the aggregate - the caller then keeps the original plan.
+template <typename Client>
+bool PartitionFold(const vector<FoldPartition> &partitions, const Client &client, Value &result) {
+	Value candidate;
+	bool found_candidate = false;
+	for (auto &partition : partitions) {
+		Value value;
+		switch (client.ClassifyPartition(partition, value)) {
+		case FoldPartitionState::EXACT_VALUE:
+			if (!found_candidate) {
+				candidate = std::move(value);
+				found_candidate = true;
+			} else {
+				client.CombineCandidate(candidate, value);
+			}
+			break;
+		case FoldPartitionState::NEUTRAL:
+			// the partition contributes no value, so it cannot affect the extremum
+			break;
+		case FoldPartitionState::BOUND:
+			// a bound always carries the value that bounds the partition
+			D_ASSERT(!value.IsNull());
+			// a bound is never exact: only an exact value can become a folded constant
+			return false;
+		case FoldPartitionState::NO_INFO:
+			// the statistics do not describe the rows that will be read
+			return false;
+		}
+	}
+	result = found_candidate ? std::move(candidate) : client.FallbackValue();
+	return true;
+}
 
 struct MinMaxColumnInfo {
 	ColumnBinding binding;
@@ -39,13 +102,13 @@ struct MinMaxColumnInfo {
 
 struct ValueComparator {
 	virtual ~ValueComparator() = default;
-	virtual bool Compare(Value &lhs, Value &rhs) const = 0;
+	virtual bool Compare(const Value &lhs, const Value &rhs) const = 0;
 	virtual Value GetVal(BaseStatistics &stats) const = 0;
 };
 
 template <typename StatsType>
 struct MinValueComp : public ValueComparator {
-	bool Compare(Value &lhs, Value &rhs) const override {
+	bool Compare(const Value &lhs, const Value &rhs) const override {
 		return lhs < rhs;
 	}
 	Value GetVal(BaseStatistics &stats) const override {
@@ -55,7 +118,7 @@ struct MinValueComp : public ValueComparator {
 
 template <typename StatsType>
 struct MaxValueComp : public ValueComparator {
-	bool Compare(Value &lhs, Value &rhs) const override {
+	bool Compare(const Value &lhs, const Value &rhs) const override {
 		return lhs > rhs;
 	}
 	Value GetVal(BaseStatistics &stats) const override {
@@ -118,125 +181,108 @@ bool TryGetMinMaxColumnInfo(const Expression &expr, MinMaxColumnInfo &info) {
 	return true;
 }
 
-//! Outcome of reading one partition's statistics for a MIN/MAX aggregate.
-enum class PartitionValueOutcome : uint8_t {
-	//! The statistics are exact and produced a usable min/max value - the only foldable outcome
-	VALUE,
-	//! The partition holds only NULL values, which MIN/MAX ignore entirely - it is neutral
-	ALL_NULL,
-	//! The statistics bound every row of the partition reliably, but are not exact: `result` holds
-	//! the bound. Good enough to vote with, never good enough to fold
-	BOUND,
-	//! No reliable state at all: the statistics do not describe the rows that will be read, or cannot
-	//! be summarized
-	NO_INFO
+//! MIN/MAX over the partition statistics. Exact partitions are reduced into a candidate, partitions
+//! holding only NULL values are neutral; when every partition is neutral the result is NULL.
+struct MinMaxFoldClient {
+	MinMaxFoldClient(MinMaxColumnInfo column_info_p, unique_ptr<ValueComparator> comparator_p,
+	                 StorageIndex storage_index_p)
+	    : column_info(std::move(column_info_p)), comparator(std::move(comparator_p)),
+	      storage_index(std::move(storage_index_p)) {
+	}
+
+	//! Classify one partition for this aggregate. On EXACT_VALUE and BOUND, `value` holds the value
+	//! respectively the bound.
+	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) const {
+		auto &stats = partition.stats;
+		if (!stats.partition_row_group) {
+			return FoldPartitionState::NO_INFO;
+		}
+		auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
+		if (!column_stats) {
+			return FoldPartitionState::NO_INFO;
+		}
+		if (stats.partition_row_group->HasPendingWrites()) {
+			// rows appended to this partition locally are not covered by the statistics, so they are
+			// not even a bound over the rows that will be read
+			return FoldPartitionState::NO_INFO;
+		}
+
+		const bool is_numeric = column_stats->GetStatsType() == StatisticsType::NUMERIC_STATS;
+		bool has_min_max;
+		if (is_numeric) {
+			has_min_max = NumericStats::HasMinMax(*column_stats);
+		} else {
+			D_ASSERT(column_stats->GetStatsType() == StatisticsType::STRING_STATS);
+			has_min_max = StringStats::HasMinMax(*column_stats);
+		}
+
+		const bool min_max_exact = stats.partition_row_group->MinMaxIsExact(storage_index);
+		if (!has_min_max) {
+			if (!min_max_exact) {
+				// with deleted rows in play the missing min/max says nothing about the surviving rows
+				return FoldPartitionState::NO_INFO;
+			}
+			// A partition without min/max holds no non-null values at all. MIN/MAX ignore NULLs, so
+			// such a partition is neutral rather than a reason to abandon the rewrite for the whole
+			// table.
+			return column_stats->CanHaveNoNull() ? FoldPartitionState::NO_INFO : FoldPartitionState::NEUTRAL;
+		}
+
+		// the statistics bound the surviving rows; deleted rows and truncated string statistics make
+		// them a bound instead of an exact value
+		bool value_is_exact = min_max_exact;
+		if (!is_numeric) {
+			value_is_exact = value_is_exact && StringStats::GetMinType(*column_stats) == StringStatsType::EXACT_STATS &&
+			                 StringStats::GetMaxType(*column_stats) == StringStatsType::EXACT_STATS;
+		}
+
+		value = comparator->GetVal(*column_stats);
+		if (value.type() != column_info.result_type) {
+			auto cast = value.DefaultTryCastAs(column_info.result_type);
+			if (!cast) {
+				// the value cannot be represented in the result type
+				return FoldPartitionState::NO_INFO;
+			}
+			value = std::move(*cast);
+		}
+		return value_is_exact ? FoldPartitionState::EXACT_VALUE : FoldPartitionState::BOUND;
+	}
+
+	void CombineCandidate(Value &candidate, Value &value) const {
+		if (comparator->Compare(value, candidate)) {
+			candidate = std::move(value);
+		}
+	}
+
+	Value FallbackValue() const {
+		// MIN/MAX over no non-null values is NULL
+		return Value(column_info.result_type);
+	}
+
+	MinMaxColumnInfo column_info;
+	unique_ptr<ValueComparator> comparator;
+	StorageIndex storage_index;
 };
 
-PartitionValueOutcome TryGetValueFromStats(const PartitionStatistics &stats, const StorageIndex &storage_index,
-                                           const ValueComparator &comparator, const LogicalType &result_type,
-                                           Value &result) {
-	if (!stats.partition_row_group) {
-		return PartitionValueOutcome::NO_INFO;
-	}
-	auto column_stats = stats.partition_row_group->GetColumnStatistics(storage_index);
-	if (!column_stats) {
-		return PartitionValueOutcome::NO_INFO;
-	}
-	if (stats.partition_row_group->HasPendingWrites()) {
-		// rows appended to this partition locally are not covered by the statistics, so they are not
-		// even a bound over the rows that will be read
-		return PartitionValueOutcome::NO_INFO;
-	}
-
-	const bool is_numeric = column_stats->GetStatsType() == StatisticsType::NUMERIC_STATS;
-	bool has_min_max;
-	if (is_numeric) {
-		has_min_max = NumericStats::HasMinMax(*column_stats);
-	} else {
-		D_ASSERT(column_stats->GetStatsType() == StatisticsType::STRING_STATS);
-		has_min_max = StringStats::HasMinMax(*column_stats);
-	}
-
-	const bool min_max_exact = stats.partition_row_group->MinMaxIsExact(storage_index);
-	if (!has_min_max) {
-		if (!min_max_exact) {
-			// with deleted rows in play the missing min/max says nothing about the surviving rows
-			return PartitionValueOutcome::NO_INFO;
+//! COUNT(*) over the partition statistics: the partition counts must be exact and are summed.
+struct CountStarFoldClient {
+	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) const {
+		if (partition.stats.count_type == CountType::COUNT_APPROXIMATE) {
+			// we cannot get an exact count
+			return FoldPartitionState::NO_INFO;
 		}
-		// A partition without min/max holds no non-null values at all. MIN/MAX ignore NULLs, so such
-		// a partition is neutral rather than a reason to abandon the rewrite for the whole table.
-		return column_stats->CanHaveNoNull() ? PartitionValueOutcome::NO_INFO : PartitionValueOutcome::ALL_NULL;
+		value = Value::BIGINT(NumericCast<int64_t>(partition.stats.count));
+		return FoldPartitionState::EXACT_VALUE;
 	}
 
-	// the statistics bound the surviving rows; deleted rows and truncated string statistics make
-	// them a bound instead of an exact value
-	bool value_is_exact = min_max_exact;
-	if (!is_numeric) {
-		value_is_exact = value_is_exact && StringStats::GetMinType(*column_stats) == StringStatsType::EXACT_STATS &&
-		                 StringStats::GetMaxType(*column_stats) == StringStatsType::EXACT_STATS;
+	void CombineCandidate(Value &candidate, Value &value) const {
+		candidate = Value::BIGINT(candidate.GetValue<int64_t>() + value.GetValue<int64_t>());
 	}
 
-	result = comparator.GetVal(*column_stats);
-	if (result.type() != result_type) {
-		auto cast = result.DefaultTryCastAs(result_type);
-		if (!cast) {
-			// the value cannot be represented in the result type
-			return PartitionValueOutcome::NO_INFO;
-		}
-		result = std::move(*cast);
+	Value FallbackValue() const {
+		return Value::BIGINT(0);
 	}
-	return value_is_exact ? PartitionValueOutcome::VALUE : PartitionValueOutcome::BOUND;
-}
-
-//! Fold the MIN/MAX aggregates over the partition statistics, appending one constant per aggregate to
-//! `types` and `agg_results` in the order of `storage_indexes`. Returns false if some partition's
-//! statistics cannot answer an aggregate.
-bool TryFoldMinMaxAggregates(const vector<PartitionStatistics> &partition_stats,
-                             const vector<StorageIndex> &storage_indexes,
-                             const vector<MinMaxColumnInfo> &min_max_columns,
-                             const vector<unique_ptr<ValueComparator>> &comparators, vector<LogicalType> &types,
-                             vector<unique_ptr<Expression>> &agg_results) {
-	for (idx_t agg_idx = 0; agg_idx < storage_indexes.size(); agg_idx++) {
-		const auto &storage_index = storage_indexes[agg_idx];
-		const auto &result_type = min_max_columns[agg_idx].result_type;
-		auto &comparator = comparators[agg_idx];
-
-		Value agg_result;
-		bool found_value = false;
-		for (const auto &stats : partition_stats) {
-			Value value;
-			switch (TryGetValueFromStats(stats, storage_index, *comparator, result_type, value)) {
-			case PartitionValueOutcome::VALUE:
-				if (!found_value || !comparator->Compare(agg_result, value)) {
-					agg_result = std::move(value);
-					found_value = true;
-				}
-				break;
-			case PartitionValueOutcome::ALL_NULL:
-				// the partition holds no non-null values, so it cannot affect the extremum
-				break;
-			case PartitionValueOutcome::BOUND:
-				// a bound always carries the value that bounds the partition
-				D_ASSERT(!value.IsNull());
-				// a bound is never exact: only an exact value can become a folded constant
-				// TODO: a BOUND partition is meant to be handled by the scan-and-merge path once that
-				// is reachable
-				return false;
-			case PartitionValueOutcome::NO_INFO:
-				// the statistics cannot answer the aggregate
-				return false;
-			}
-		}
-		if (!found_value) {
-			// every partition holds only NULLs - MIN/MAX over no non-null values is NULL
-			agg_result = Value(result_type);
-		}
-		types.push_back(agg_result.type());
-		auto expr = make_uniq<BoundConstantExpression>(agg_result);
-		agg_results.push_back(std::move(expr));
-	}
-	return true;
-}
+};
 
 bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) {
 	if (aggr.grouping_sets.empty()) {
@@ -261,6 +307,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	// check if all aggregates are COUNT(*), MIN or MAX
 	vector<idx_t> count_star_idxs;
 	vector<MinMaxColumnInfo> min_max_columns;
+	vector<idx_t> min_max_aggr_idxs;
 	vector<unique_ptr<ValueComparator>> comparators;
 
 	for (idx_t i = 0; i < aggr.expressions.size(); i++) {
@@ -288,6 +335,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				return;
 			}
 			min_max_columns.push_back(column_info);
+			min_max_aggr_idxs.push_back(i);
 			auto comparator = GetComparator(fun_name, column_info.input_type);
 			if (!comparator) {
 				// Type has no min max statistics
@@ -354,10 +402,10 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		}
 	}
 
-	vector<LogicalType> types;
-	vector<unique_ptr<Expression>> agg_results;
+	// Build the partition list shared by filter classification and folding; `original_index` is the
+	// position of the partition in the row-group list
+	vector<FoldPartition> partitions;
 	bool need_to_scan = false;
-	vector<idx_t> scan_partition_indices;
 	// we can keep execute eager aggregate if all partitions could be either filtered entirely or remained entirely
 	if (get.table_filters.HasFilters()) {
 		map<StorageIndex, reference<TableFilter>> filter_storage_index_map;
@@ -371,7 +419,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			}
 			filter_storage_index_map.emplace(storage_index, filter);
 		}
-		vector<PartitionStatistics> precomputed_partition_stats;
 		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
 			auto &stats = partition_stats[partition_idx];
 			if (!stats.partition_row_group) {
@@ -407,50 +454,24 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			}
 			switch (filter_result) {
 			case FilterPropagateResult::FILTER_ALWAYS_TRUE:
-				precomputed_partition_stats.push_back(std::move(stats));
+				partitions.emplace_back(std::move(stats), partition_idx, FilterPropagateResult::FILTER_ALWAYS_TRUE);
 				break;
 			case FilterPropagateResult::FILTER_ALWAYS_FALSE:
 				break;
 			default:
 				need_to_scan = true;
-				scan_partition_indices.push_back(partition_idx);
 				break;
 			}
 		}
-		if (precomputed_partition_stats.empty()) {
-			// no partitions can be pre-computed
-			return;
+	} else {
+		for (idx_t partition_idx = 0; partition_idx < partition_stats.size(); partition_idx++) {
+			partitions.emplace_back(std::move(partition_stats[partition_idx]), partition_idx,
+			                        FilterPropagateResult::FILTER_ALWAYS_TRUE);
 		}
-		partition_stats = std::move(precomputed_partition_stats);
 	}
-
-	if (partition_stats.empty()) {
+	if (partitions.empty()) {
 		// no partitions can be pre-computed
 		return;
-	}
-
-	if (!min_max_columns.empty()) {
-		// Execute min/max aggregates on partition statistics
-		if (!TryFoldMinMaxAggregates(partition_stats, min_max_storage_indexes, min_max_columns, comparators, types,
-		                             agg_results)) {
-			return;
-		}
-	}
-	if (!count_star_idxs.empty()) {
-		// Execute count_star aggregates on partition statistics
-		idx_t count = 0;
-		for (const auto &stats : partition_stats) {
-			if (stats.count_type == CountType::COUNT_APPROXIMATE) {
-				// we cannot get an exact count
-				return;
-			}
-			count += stats.count;
-		}
-		for (const auto count_star_idx : count_star_idxs) {
-			auto count_result = make_uniq<BoundConstantExpression>(Value::BIGINT(NumericCast<int64_t>(count)));
-			agg_results.emplace(agg_results.begin() + NumericCast<int64_t>(count_star_idx), std::move(count_result));
-			types.insert(types.begin() + NumericCast<int64_t>(count_star_idx), LogicalType::BIGINT);
-		}
 	}
 
 	if (need_to_scan) {
@@ -460,69 +481,31 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		// rows are counted twice. Only the full precomputation (no scan) is safe.
 		return;
 	}
-	if (need_to_scan) {
-		// Partial precomputation: some partitions need scanning
-		// Insert a LogicalProjection above the aggregate that combines pre-computed constants with scan results
-		if (!get.function.set_partitions_to_scan) {
-			// scan does not support partition filtering - bail out
+
+	// Fold each recognized aggregate with a stack-allocated client of its own type
+	vector<Value> results(aggr.expressions.size());
+	for (idx_t i = 0; i < min_max_columns.size(); i++) {
+		MinMaxFoldClient client(min_max_columns[i], std::move(comparators[i]), min_max_storage_indexes[i]);
+		if (!PartitionFold(partitions, client, results[min_max_aggr_idxs[i]])) {
+			// some aggregate cannot be answered from the statistics - keep the aggregate plan
 			return;
 		}
-
-		// Build projection expressions that merge pre-computed values with aggregate results
-		auto proj_index = optimizer.binder.GenerateTableIndex();
-		vector<unique_ptr<Expression>> proj_expressions;
-		for (idx_t i = 0; i < aggr.expressions.size(); i++) {
-			auto &aggr_expr = aggr.expressions[i]->Cast<BoundAggregateExpression>();
-			auto &fun_name = aggr_expr.Function().GetName();
-
-			// Reference to the aggregate output column
-			auto agg_col_ref = make_uniq<BoundColumnRefExpression>(
-			    aggr_expr.GetReturnType(), ColumnBinding(aggr.aggregate_index, ProjectionIndex(i)));
-
-			if (fun_name == "count_star") {
-				// pre_count + count_star_from_scan
-				auto &pre_count_expr = agg_results[i];
-				auto add_expr = optimizer.BindScalarFunction("+", pre_count_expr->Copy(), std::move(agg_col_ref));
-				add_expr->SetAlias(aggr.expressions[i]->GetAlias());
-				proj_expressions.push_back(std::move(add_expr));
-			} else if (fun_name == "min" || fun_name == "max") {
-				// For min: COALESCE(least(pre_min, agg_min), pre_min)
-				// For max: COALESCE(greatest(pre_max, agg_max), pre_max)
-				auto &pre_val_expr = agg_results[i];
-				Identifier merge_func((fun_name == "min") ? "least" : "greatest");
-				auto merged = optimizer.BindScalarFunction(merge_func, pre_val_expr->Copy(), std::move(agg_col_ref));
-				auto coalesce =
-				    make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, aggr_expr.GetReturnType());
-				coalesce->GetChildrenMutable().push_back(std::move(merged));
-				coalesce->GetChildrenMutable().push_back(pre_val_expr->Copy());
-				coalesce->SetAlias(aggr.expressions[i]->GetAlias());
-				proj_expressions.push_back(std::move(coalesce));
-			}
+	}
+	for (auto count_star_idx : count_star_idxs) {
+		CountStarFoldClient client;
+		if (!PartitionFold(partitions, client, results[count_star_idx])) {
+			return;
 		}
-
-		// Tell the scan to only scan partitions whose aggregates were NOT pre-computed
-		get.SetPartitionsToScan(std::move(scan_partition_indices));
-
-		// Create LogicalProjection above the aggregate
-		auto projection = make_uniq<LogicalProjection>(proj_index, std::move(proj_expressions));
-		projection->children.push_back(std::move(node_ptr));
-
-		ColumnBindingReplacer replacer;
-		for (idx_t i = 0; i < aggr.expressions.size(); i++) {
-			auto old_binding = ColumnBinding(aggr.aggregate_index, ProjectionIndex(i));
-			auto new_binding = ColumnBinding(proj_index, ProjectionIndex(i));
-			replacer.replacement_bindings.emplace_back(old_binding, new_binding);
-		}
-
-		replacer.stop_operator = projection.get();
-		node_ptr = std::move(projection);
-		replacer.VisitOperator(*root);
-		return;
 	}
 
-	// Set column names
+	// every aggregate folded: replace it with its constant, in aggregate order
+	vector<LogicalType> types(aggr.expressions.size());
+	vector<unique_ptr<Expression>> agg_results(aggr.expressions.size());
 	for (idx_t expr_idx = 0; expr_idx < agg_results.size(); expr_idx++) {
-		agg_results[expr_idx]->SetAlias(aggr.expressions[expr_idx]->GetAlias());
+		auto constant = make_uniq<BoundConstantExpression>(results[expr_idx]);
+		constant->SetAlias(aggr.expressions[expr_idx]->GetAlias());
+		agg_results[expr_idx] = std::move(constant);
+		types[expr_idx] = results[expr_idx].type();
 	}
 
 	vector<vector<unique_ptr<Expression>>> expressions;
