@@ -216,7 +216,7 @@ struct MinMaxFoldClient {
 
 	bool ExcludesCandidate(const FoldPartition &partition, const Value &bound, const Value &candidate) const {
 		if (column_info.input_type == LogicalType::VARCHAR) {
-			return ExcludesStringCandidate(partition, candidate);
+			return ExcludesStringCandidate(partition, bound, candidate);
 		}
 		// the partition is excluded when its bound is weakly dominated by the candidate: a surviving
 		// row changes the candidate only if it compares strictly better than it
@@ -232,13 +232,19 @@ private:
 	//! String statistics may keep only a truncated prefix of the values, so the stored bound does
 	//! not bound the true extremum: the exclusion goes through CheckZonemap, the same
 	//! truncation-safe primitive filter pushdown uses.
-	bool ExcludesStringCandidate(const FoldPartition &partition, const Value &candidate) const {
+	bool ExcludesStringCandidate(const FoldPartition &partition, const Value &bound, const Value &candidate) const {
 		if (!partition.stats.partition_row_group) {
 			return false;
 		}
 		auto column_stats = partition.stats.partition_row_group->GetColumnStatistics(storage_index);
 		if (!column_stats || !StringStats::HasMinMax(*column_stats)) {
 			return false;
+		}
+		if (StringStats::GetMinType(*column_stats) == StringStatsType::EXACT_STATS &&
+		    StringStats::GetMaxType(*column_stats) == StringStatsType::EXACT_STATS) {
+			// exact statistics: the truncation-safe zone map degenerates to the weak-domination
+			// comparison, which is cheaper
+			return !comparator->Compare(bound, candidate);
 		}
 		auto comparison = column_info.is_min ? ExpressionType::COMPARE_LESSTHAN : ExpressionType::COMPARE_GREATERTHAN;
 		return StringStats::CheckZonemap(*column_stats, comparison, array_ptr<const Value>(&candidate, 1)) ==
@@ -454,6 +460,10 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			default:
 				// the filter cuts the partition: the surviving rows are a subset of the rows the
 				// statistics describe, so the partition enters the fold as a bound
+				// TODO: StringStats::CheckZonemap never reports FILTER_ALWAYS_TRUE (the numeric
+				// zonemap can), so any retained VARCHAR predicate turns the aligned partitions into
+				// residuals as well: there is no exact candidate and the fold is vetoed. Reporting
+				// ALWAYS_TRUE for aligned string partitions would let string aggregates fold here.
 				partitions.emplace_back(std::move(stats), partition_idx, filter_result);
 				break;
 			}

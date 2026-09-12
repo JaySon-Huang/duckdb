@@ -17,6 +17,12 @@ USE db
 statement ok
 CREATE TABLE t AS (SELECT * FROM range(8192) _(i), LATERAL (select (i*2) as j));
 
+statement ok
+CREATE TABLE t_str (s VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO t_str SELECT 'z' || lpad(i::VARCHAR, 4, '0'), i FROM range(8192) _(i);
+
 # Work-around for unsetting version info
 statement ok
 ATTACH '{TEST_DIR}/tmp.duckdb' AS tmp
@@ -105,6 +111,31 @@ query II
 explain SELECT count(*),max(i),min(i) FROM t where i >=2048 and j > 20000
 ----
 physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+# a string aggregate over a partition the (integer) filter cuts: the residual partition's exact
+# string bound (z2047) is dominated by the exact candidate (z8191), so the weak-domination
+# comparison prunes it and the fold happens
+query II
+EXPLAIN SELECT max(s) FROM t_str WHERE i > 100
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(s) FROM t_str WHERE i > 100
+----
+z8191
+
+# the true minimum lives in the surviving part of the cut row group: its exact bound (z0000) is not
+# dominated by the exact candidate (z2048), so the fold is vetoed
+query II
+EXPLAIN SELECT min(s) FROM t_str WHERE i > 100
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT min(s) FROM t_str WHERE i > 100
+----
+z0101
 
 # a single-column filter that prunes every partition is intercepted earlier (the scan becomes an
 # empty result); two filters that each kill different row groups are not: every partition is
