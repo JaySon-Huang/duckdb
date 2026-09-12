@@ -34,7 +34,7 @@ struct ScriptedFoldClient {
 		}
 	}
 
-	bool ExcludesCandidate(const Value &, const Value &) const {
+	bool ExcludesCandidate(const FoldPartition &, const Value &, const Value &) const {
 		exclude_calls++;
 		return excludes;
 	}
@@ -71,7 +71,7 @@ struct SummingFoldClient {
 		candidate = Value::BIGINT(candidate.GetValue<int64_t>() + value.GetValue<int64_t>());
 	}
 
-	bool ExcludesCandidate(const Value &, const Value &) const {
+	bool ExcludesCandidate(const FoldPartition &, const Value &, const Value &) const {
 		return false;
 	}
 

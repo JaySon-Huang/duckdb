@@ -44,6 +44,38 @@ CREATE TABLE t_added (i INTEGER, c INTEGER)
 statement ok
 INSERT INTO t_added SELECT i, i FROM range(2048) _(i)
 
+# tables for truncated-string voting: the long-string row group's inlined 12-byte prefix
+# participates as a bound through CheckZonemap
+statement ok
+CREATE TABLE t_strvote (s VARCHAR)
+
+statement ok
+INSERT INTO t_strvote SELECT 'z' || i FROM range(0, 2048) _(i)
+
+statement ok
+INSERT INTO t_strvote SELECT 'z0' || repeat('a', 40) FROM range(2048)
+
+statement ok
+CREATE TABLE t_strveto (s VARCHAR)
+
+statement ok
+INSERT INTO t_strveto SELECT 'z' || i FROM range(0, 2048) _(i)
+
+statement ok
+INSERT INTO t_strveto SELECT 'z9' || repeat('a', 40) FROM range(2048)
+
+statement ok
+CREATE TABLE t_strtie (s VARCHAR)
+
+statement ok
+INSERT INTO t_strtie SELECT 'a' || i FROM range(0, 2047) _(i)
+
+statement ok
+INSERT INTO t_strtie SELECT 'z0aaaaaaaaaa'
+
+statement ok
+INSERT INTO t_strtie SELECT 'z0aaaaaaaaaa' || i FROM range(2048) t(i)
+
 statement ok
 CREATE TABLE t_empty (i INTEGER)
 
@@ -199,6 +231,42 @@ query II
 SELECT min(s), max(s) FROM tshort
 ----
 a0	a999
+
+# the truncated prefix ('z0aaaaaaaaaa') is strictly below the exact candidate ('z999'):
+# CheckZonemap excludes the truncated row group and the fold happens
+query II
+EXPLAIN SELECT min(s), max(s) FROM t_strvote
+----
+physical_plan	<!REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query II
+SELECT min(s), max(s) FROM t_strvote
+----
+z0	z999
+
+# the truncated prefix ('z9aaaaaaaaaa') is above the candidate ('z999') for max:
+# the truncated row group may hold the true maximum, so the fold is vetoed
+query II
+EXPLAIN SELECT min(s), max(s) FROM t_strveto
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(s) = 'z9' || repeat('a', 40) FROM t_strveto
+----
+true
+
+# the candidate equals the truncated prefix: a tie must not prune, the true extremum may live in
+# the truncated row group
+query II
+EXPLAIN SELECT max(s) FROM t_strtie
+----
+physical_plan	<REGEX>:.*UNGROUPED_AGGREGATE.*
+
+query I
+SELECT max(s) FROM t_strtie
+----
+z0aaaaaaaaaa999
 
 # control: a row-group-aligned filter still folds
 query II

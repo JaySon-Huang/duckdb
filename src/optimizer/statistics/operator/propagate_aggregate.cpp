@@ -35,6 +35,7 @@ struct MinMaxColumnInfo {
 	ColumnBinding binding;
 	LogicalType input_type;
 	LogicalType result_type;
+	bool is_min;
 };
 
 struct ValueComparator {
@@ -191,11 +192,9 @@ struct MinMaxFoldClient {
 		}
 	}
 
-	bool ExcludesCandidate(const Value &bound, const Value &candidate) const {
+	bool ExcludesCandidate(const FoldPartition &partition, const Value &bound, const Value &candidate) const {
 		if (column_info.input_type == LogicalType::VARCHAR) {
-			// string statistics may keep only a truncated prefix of the value: the bound does not
-			// upper-bound the true maximum, so a plain comparison cannot exclude the partition
-			return false;
+			return ExcludesStringCandidate(partition, candidate);
 		}
 		return comparator->Compare(candidate, bound);
 	}
@@ -203,6 +202,23 @@ struct MinMaxFoldClient {
 	Value FallbackValue() const {
 		// MIN/MAX over no non-null values is NULL
 		return Value(column_info.result_type);
+	}
+
+private:
+	//! String statistics may keep only a truncated prefix of the values, so the stored bound does
+	//! not bound the true extremum: the exclusion goes through CheckZonemap, the same
+	//! truncation-safe primitive filter pushdown uses.
+	bool ExcludesStringCandidate(const FoldPartition &partition, const Value &candidate) const {
+		if (!partition.stats.partition_row_group) {
+			return false;
+		}
+		auto column_stats = partition.stats.partition_row_group->GetColumnStatistics(storage_index);
+		if (!column_stats || !StringStats::HasMinMax(*column_stats)) {
+			return false;
+		}
+		auto comparison = column_info.is_min ? ExpressionType::COMPARE_LESSTHAN : ExpressionType::COMPARE_GREATERTHAN;
+		return StringStats::CheckZonemap(*column_stats, comparison, array_ptr<const Value>(&candidate, 1)) ==
+		       FilterPropagateResult::FILTER_ALWAYS_FALSE;
 	}
 
 	MinMaxColumnInfo column_info;
@@ -225,7 +241,7 @@ struct CountStarFoldClient {
 		candidate = Value::BIGINT(candidate.GetValue<int64_t>() + value.GetValue<int64_t>());
 	}
 
-	bool ExcludesCandidate(const Value &, const Value &) const {
+	bool ExcludesCandidate(const FoldPartition &, const Value &, const Value &) const {
 		// a count has no bound source - every partition must be exact
 		return false;
 	}
@@ -286,6 +302,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				return;
 			}
 			min_max_columns.push_back(column_info);
+			min_max_columns.back().is_min = fun_name == "min";
 			min_max_aggr_idxs.push_back(i);
 			auto comparator = GetComparator(fun_name, column_info.input_type);
 			if (!comparator) {

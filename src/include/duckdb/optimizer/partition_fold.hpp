@@ -59,10 +59,11 @@ concept PartitionFoldClient = requires(const Client &client, const FoldPartition
 	{ client.ClassifyPartition(partition, value) } -> std::same_as<FoldPartitionState>;
 	// Merge an exact value into the running candidate.
 	client.CombineCandidate(value, value);
-	// Whether a BOUND partition cannot contribute a value strictly better than the candidate. The
-	// comparison must be sound for the kind of bound the client returned - statistics that are not
-	// safe for a plain comparison (e.g. truncated string prefixes) must not be excluded.
-	{ client.ExcludesCandidate(value, value) } -> std::same_as<bool>;
+	// Whether a BOUND partition cannot contribute a value strictly better than the candidate. Only
+	// consulted after the exact partitions have produced a candidate. The comparison must be sound
+	// for the kind of bound the client returned - statistics that are not safe for a plain value
+	// comparison (e.g. truncated string prefixes) must use a truncation-safe comparison instead.
+	{ client.ExcludesCandidate(partition, value, value) } -> std::same_as<bool>;
 	// The result when every partition is NEUTRAL.
 	{ client.FallbackValue() } -> std::same_as<Value>;
 };
@@ -76,13 +77,14 @@ template <typename T, typename = void>
 struct IsPartitionFoldClient : std::false_type {};
 
 template <typename T>
-struct IsPartitionFoldClient<T, std::void_t<decltype(std::declval<const T &>().ClassifyPartition(
-                                                std::declval<const FoldPartition &>(), std::declval<Value &>())),
-                                            decltype(std::declval<const T &>().CombineCandidate(
-                                                std::declval<Value &>(), std::declval<Value &>())),
-                                            decltype(std::declval<const T &>().ExcludesCandidate(
-                                                std::declval<const Value &>(), std::declval<const Value &>())),
-                                            decltype(std::declval<const T &>().FallbackValue())>> : std::true_type {};
+struct IsPartitionFoldClient<
+    T, std::void_t<
+           decltype(std::declval<const T &>().ClassifyPartition(std::declval<const FoldPartition &>(),
+                                                                std::declval<Value &>())),
+           decltype(std::declval<const T &>().CombineCandidate(std::declval<Value &>(), std::declval<Value &>())),
+           decltype(std::declval<const T &>().ExcludesCandidate(
+               std::declval<const FoldPartition &>(), std::declval<const Value &>(), std::declval<const Value &>())),
+           decltype(std::declval<const T &>().FallbackValue())>> : std::true_type {};
 #endif
 
 //! Fold one aggregate over the partitions with the compile-time client policy `Client`, keeping the
@@ -94,7 +96,7 @@ bool PartitionFold(const vector<FoldPartition> &partitions, const Client &client
 	              "Client must provide ClassifyPartition, CombineCandidate, ExcludesCandidate and FallbackValue");
 	Value candidate;
 	bool found_candidate = false;
-	vector<Value> bounds;
+	vector<pair<const FoldPartition *, Value>> bounds;
 	for (auto &partition : partitions) {
 		Value value;
 		switch (client.ClassifyPartition(partition, value)) {
@@ -113,7 +115,7 @@ bool PartitionFold(const vector<FoldPartition> &partitions, const Client &client
 			// the bound covers every surviving row but is not attained by any of them: it can never
 			// become the candidate, it can only be excluded by one
 			D_ASSERT(!value.IsNull());
-			bounds.push_back(std::move(value));
+			bounds.emplace_back(&partition, std::move(value));
 			break;
 		case FoldPartitionState::NO_INFO:
 			// the statistics do not describe the rows that will be read
@@ -129,8 +131,8 @@ bool PartitionFold(const vector<FoldPartition> &partitions, const Client &client
 		result = client.FallbackValue();
 		return true;
 	}
-	for (auto &bound : bounds) {
-		if (!client.ExcludesCandidate(bound, candidate)) {
+	for (auto &entry : bounds) {
+		if (!client.ExcludesCandidate(*entry.first, entry.second, candidate)) {
 			// the partition may hold a surviving row that beats the candidate
 			return false;
 		}
