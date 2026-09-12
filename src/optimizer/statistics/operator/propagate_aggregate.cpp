@@ -177,9 +177,11 @@ struct MinMaxFoldClient {
 				// the filter cannot turn a partition without non-null values into one with them
 				return column_stats->CanHaveNoNull() ? FoldPartitionState::NO_INFO : FoldPartitionState::NEUTRAL;
 			}
-			return ExtractMinMaxValue(*column_stats, *comparator, column_info.result_type, value)
-			           ? FoldPartitionState::BOUND
-			           : FoldPartitionState::NO_INFO;
+			if (!ExtractMinMaxValue(*column_stats, *comparator, column_info.result_type, value)) {
+				return FoldPartitionState::NO_INFO;
+			}
+			CacheBoundStats(partition, std::move(column_stats));
+			return FoldPartitionState::BOUND;
 		}
 
 		const bool min_max_exact = stats.partition_row_group->MinMaxIsExact(storage_index);
@@ -205,7 +207,11 @@ struct MinMaxFoldClient {
 		if (!ExtractMinMaxValue(*column_stats, *comparator, column_info.result_type, value)) {
 			return FoldPartitionState::NO_INFO;
 		}
-		return value_is_exact ? FoldPartitionState::EXACT_VALUE : FoldPartitionState::BOUND;
+		if (!value_is_exact) {
+			CacheBoundStats(partition, std::move(column_stats));
+			return FoldPartitionState::BOUND;
+		}
+		return FoldPartitionState::EXACT_VALUE;
 	}
 
 	void CombineCandidate(Value &candidate, Value &value) const {
@@ -229,14 +235,23 @@ struct MinMaxFoldClient {
 	}
 
 private:
+	//! Remember the column statistics fetched while classifying a BOUND partition. The engine votes
+	//! the bounds back in classification order, so the exclusion reuses the fetch instead of reading
+	//! the column statistics a second time.
+	void CacheBoundStats(const FoldPartition &partition, unique_ptr<BaseStatistics> column_stats) const {
+		if (column_info.input_type == LogicalType::VARCHAR) {
+			bound_stats.emplace_back(&partition, std::move(column_stats));
+		}
+	}
+
 	//! String statistics may keep only a truncated prefix of the values, so the stored bound does
 	//! not bound the true extremum: the exclusion goes through CheckZonemap, the same
 	//! truncation-safe primitive filter pushdown uses.
 	bool ExcludesStringCandidate(const FoldPartition &partition, const Value &bound, const Value &candidate) const {
-		if (!partition.stats.partition_row_group) {
-			return false;
-		}
-		auto column_stats = partition.stats.partition_row_group->GetColumnStatistics(storage_index);
+		D_ASSERT(bound_stats_idx < bound_stats.size());
+		auto &entry = bound_stats[bound_stats_idx++];
+		D_ASSERT(entry.first == &partition);
+		auto &column_stats = entry.second;
 		if (!column_stats || !StringStats::HasMinMax(*column_stats)) {
 			return false;
 		}
@@ -254,6 +269,9 @@ private:
 	MinMaxColumnInfo column_info;
 	unique_ptr<ValueComparator> comparator;
 	StorageIndex storage_index;
+	//! Statistics of this client's BOUND partitions, in classification order
+	mutable vector<pair<const FoldPartition *, unique_ptr<BaseStatistics>>> bound_stats;
+	mutable idx_t bound_stats_idx = 0;
 };
 
 //! COUNT(*) over the partition statistics: the partition counts must be exact and are summed.
