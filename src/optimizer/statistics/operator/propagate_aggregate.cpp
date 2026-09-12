@@ -58,65 +58,39 @@ struct FoldPartition {
 	FilterPropagateResult filter_result;
 };
 
-//! Per-aggregate hooks of an aggregate family participating in the fold. Implementations classify
-//! partitions and define what happens when every partition turns out to be neutral. The engine
-//! never sees expressions.
-class PartitionFoldClient {
-public:
-	virtual ~PartitionFoldClient() = default;
-
-	//! Classify one partition for this aggregate. On EXACT_VALUE, `value` holds the exact value; on
-	//! BOUND, `value` holds the bound covering every surviving row.
-	virtual FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) = 0;
-	//! Merge an exact partition value into the running candidate (extremum families replace the
-	//! candidate when the value is strictly better, count sums it). Called only after the first
-	//! exact value initialized the candidate.
-	virtual void CombineCandidate(Value &candidate, Value &value) = 0;
-	//! Whether a BOUND partition cannot contribute a value strictly better than the candidate. Only
-	//! consulted once bound voting is activated - until then every BOUND vetoes the fold.
-	virtual bool ExcludesCandidate(const Value &bound, const Value &candidate) = 0;
-	//! The result when every partition is NEUTRAL (MIN/MAX over no non-null values is NULL, COUNT is 0)
-	virtual Value FallbackValue() = 0;
-};
-
-//! Fold every client's aggregate over the partitions. On success, `results[i]` holds the constant
-//! for `clients[i]`. Returns false if any aggregate cannot be folded - the caller keeps the
-//! original aggregate plan. All-or-nothing: partial folding is a future extension.
-bool PartitionFold(const vector<FoldPartition> &partitions, const vector<reference<PartitionFoldClient>> &clients,
-                   vector<Value> &results) {
-	results.resize(clients.size());
-	for (idx_t client_idx = 0; client_idx < clients.size(); client_idx++) {
-		auto &client = clients[client_idx].get();
-
-		Value candidate;
-		bool found_candidate = false;
-		for (auto &partition : partitions) {
-			Value value;
-			switch (client.ClassifyPartition(partition, value)) {
-			case FoldPartitionState::EXACT_VALUE:
-				if (!found_candidate) {
-					candidate = std::move(value);
-					found_candidate = true;
-				} else {
-					client.CombineCandidate(candidate, value);
-				}
-				break;
-			case FoldPartitionState::NEUTRAL:
-				// the partition contributes no value, so it cannot affect the extremum
-				break;
-			case FoldPartitionState::BOUND:
-				// a bound always carries the value that bounds the partition
-				D_ASSERT(!value.IsNull());
-				// a bound is never exact: until bound voting is activated, no client can prove that
-				// the partition cannot contribute a better value
-				return false;
-			case FoldPartitionState::NO_INFO:
-				// the statistics do not describe the rows that will be read
-				return false;
+//! Fold one aggregate over the partitions with the compile-time client policy `Client`. A policy
+//! provides ClassifyPartition, CombineCandidate and FallbackValue; using a template keeps the
+//! per-aggregate families free of virtual dispatch and per-aggregate allocations. Returns false
+//! when the statistics cannot answer the aggregate - the caller then keeps the original plan.
+template <typename Client>
+bool PartitionFold(const vector<FoldPartition> &partitions, const Client &client, Value &result) {
+	Value candidate;
+	bool found_candidate = false;
+	for (auto &partition : partitions) {
+		Value value;
+		switch (client.ClassifyPartition(partition, value)) {
+		case FoldPartitionState::EXACT_VALUE:
+			if (!found_candidate) {
+				candidate = std::move(value);
+				found_candidate = true;
+			} else {
+				client.CombineCandidate(candidate, value);
 			}
+			break;
+		case FoldPartitionState::NEUTRAL:
+			// the partition contributes no value, so it cannot affect the extremum
+			break;
+		case FoldPartitionState::BOUND:
+			// a bound always carries the value that bounds the partition
+			D_ASSERT(!value.IsNull());
+			// a bound is never exact: only an exact value can become a folded constant
+			return false;
+		case FoldPartitionState::NO_INFO:
+			// the statistics do not describe the rows that will be read
+			return false;
 		}
-		results[client_idx] = found_candidate ? std::move(candidate) : client.FallbackValue();
 	}
+	result = found_candidate ? std::move(candidate) : client.FallbackValue();
 	return true;
 }
 
@@ -209,8 +183,7 @@ bool TryGetMinMaxColumnInfo(const Expression &expr, MinMaxColumnInfo &info) {
 
 //! MIN/MAX over the partition statistics. Exact partitions are reduced into a candidate, partitions
 //! holding only NULL values are neutral; when every partition is neutral the result is NULL.
-class MinMaxFoldClient : public PartitionFoldClient {
-public:
+struct MinMaxFoldClient {
 	MinMaxFoldClient(MinMaxColumnInfo column_info_p, unique_ptr<ValueComparator> comparator_p,
 	                 StorageIndex storage_index_p)
 	    : column_info(std::move(column_info_p)), comparator(std::move(comparator_p)),
@@ -219,7 +192,7 @@ public:
 
 	//! Classify one partition for this aggregate. On EXACT_VALUE and BOUND, `value` holds the value
 	//! respectively the bound.
-	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) override {
+	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) const {
 		auto &stats = partition.stats;
 		if (!stats.partition_row_group) {
 			return FoldPartitionState::NO_INFO;
@@ -275,31 +248,25 @@ public:
 		return value_is_exact ? FoldPartitionState::EXACT_VALUE : FoldPartitionState::BOUND;
 	}
 
-	void CombineCandidate(Value &candidate, Value &value) override {
+	void CombineCandidate(Value &candidate, Value &value) const {
 		if (comparator->Compare(value, candidate)) {
 			candidate = std::move(value);
 		}
 	}
 
-	bool ExcludesCandidate(const Value &bound, const Value &candidate) override {
-		return comparator->Compare(candidate, bound);
-	}
-
-	Value FallbackValue() override {
+	Value FallbackValue() const {
 		// MIN/MAX over no non-null values is NULL
 		return Value(column_info.result_type);
 	}
 
-private:
 	MinMaxColumnInfo column_info;
 	unique_ptr<ValueComparator> comparator;
 	StorageIndex storage_index;
 };
 
 //! COUNT(*) over the partition statistics: the partition counts must be exact and are summed.
-class CountStarFoldClient : public PartitionFoldClient {
-public:
-	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) override {
+struct CountStarFoldClient {
+	FoldPartitionState ClassifyPartition(const FoldPartition &partition, Value &value) const {
 		if (partition.stats.count_type == CountType::COUNT_APPROXIMATE) {
 			// we cannot get an exact count
 			return FoldPartitionState::NO_INFO;
@@ -308,16 +275,11 @@ public:
 		return FoldPartitionState::EXACT_VALUE;
 	}
 
-	void CombineCandidate(Value &candidate, Value &value) override {
+	void CombineCandidate(Value &candidate, Value &value) const {
 		candidate = Value::BIGINT(candidate.GetValue<int64_t>() + value.GetValue<int64_t>());
 	}
 
-	bool ExcludesCandidate(const Value &bound, const Value &candidate) override {
-		// a count has no bound source - every partition must be exact
-		return false;
-	}
-
-	Value FallbackValue() override {
+	Value FallbackValue() const {
 		return Value::BIGINT(0);
 	}
 };
@@ -520,24 +482,20 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
-	// Construct one fold client per recognized aggregate, in aggregate order
-	vector<unique_ptr<PartitionFoldClient>> clients(aggr.expressions.size());
+	// Fold each recognized aggregate with a stack-allocated client of its own type
+	vector<Value> results(aggr.expressions.size());
 	for (idx_t i = 0; i < min_max_columns.size(); i++) {
-		clients[min_max_aggr_idxs[i]] =
-		    make_uniq<MinMaxFoldClient>(min_max_columns[i], std::move(comparators[i]), min_max_storage_indexes[i]);
+		MinMaxFoldClient client(min_max_columns[i], std::move(comparators[i]), min_max_storage_indexes[i]);
+		if (!PartitionFold(partitions, client, results[min_max_aggr_idxs[i]])) {
+			// some aggregate cannot be answered from the statistics - keep the aggregate plan
+			return;
+		}
 	}
 	for (auto count_star_idx : count_star_idxs) {
-		clients[count_star_idx] = make_uniq<CountStarFoldClient>();
-	}
-	vector<reference<PartitionFoldClient>> client_refs;
-	for (auto &client : clients) {
-		client_refs.push_back(*client);
-	}
-
-	vector<Value> results;
-	if (!PartitionFold(partitions, client_refs, results)) {
-		// some aggregate cannot be answered from the statistics - keep the aggregate plan
-		return;
+		CountStarFoldClient client;
+		if (!PartitionFold(partitions, client, results[count_star_idx])) {
+			return;
+		}
 	}
 
 	// every aggregate folded: replace it with its constant, in aggregate order
