@@ -501,8 +501,9 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	// partition-statistics list that is empty to begin with is different - it means the statistics
 	// are unknown, not that there are no rows - and is rejected earlier.
 
-	// Fold each recognized aggregate with a stack-allocated client of its own type
-	vector<Value> results(aggr.expressions.size());
+	// Fold each recognized aggregate with a stack-allocated client of its own type; the recognition
+	// loop above bails on anything but count_star/min/max, so the folds below fill every slot
+	vector<Value> results(aggr.expressions.size(), Value(LogicalType::INVALID));
 	for (idx_t i = 0; i < min_max_columns.size(); i++) {
 		MinMaxFoldClient client(min_max_columns[i], std::move(comparators[i]), min_max_storage_indexes[i]);
 		if (!PartitionFold(partitions, client, results[min_max_aggr_idxs[i]])) {
@@ -521,6 +522,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 	vector<LogicalType> types(aggr.expressions.size());
 	vector<unique_ptr<Expression>> agg_results(aggr.expressions.size());
 	for (idx_t expr_idx = 0; expr_idx < agg_results.size(); expr_idx++) {
+		D_ASSERT(results[expr_idx].type().id() != LogicalTypeId::INVALID);
 		auto constant = make_uniq<BoundConstantExpression>(results[expr_idx]);
 		constant->SetAlias(aggr.expressions[expr_idx]->GetAlias());
 		agg_results[expr_idx] = std::move(constant);
