@@ -7,6 +7,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -235,12 +236,12 @@ struct MinMaxFoldClient {
 	}
 
 private:
-	//! Remember the column statistics fetched while classifying a BOUND partition. The engine votes
-	//! the bounds back in classification order, so the exclusion reuses the fetch instead of reading
-	//! the column statistics a second time.
+	//! Remember the column statistics fetched while classifying a BOUND partition, keyed by partition
+	//! identity, so the exclusion reuses the fetch instead of reading the column statistics a second
+	//! time.
 	void CacheBoundStats(const FoldPartition &partition, unique_ptr<BaseStatistics> column_stats) const {
 		if (column_info.input_type == LogicalType::VARCHAR) {
-			bound_stats.emplace_back(&partition, std::move(column_stats));
+			bound_stats.emplace(&partition, std::move(column_stats));
 		}
 	}
 
@@ -248,10 +249,13 @@ private:
 	//! not bound the true extremum: the exclusion goes through CheckZonemap, the same
 	//! truncation-safe primitive filter pushdown uses.
 	bool ExcludesStringCandidate(const FoldPartition &partition, const Value &bound, const Value &candidate) const {
-		D_ASSERT(bound_stats_idx < bound_stats.size());
-		auto &entry = bound_stats[bound_stats_idx++];
-		D_ASSERT(entry.first == &partition);
-		auto &column_stats = entry.second;
+		auto entry = bound_stats.find(&partition);
+		D_ASSERT(entry != bound_stats.end());
+		if (entry == bound_stats.end()) {
+			// nothing was cached for this partition: the vote must assume it may beat the candidate
+			return false;
+		}
+		auto &column_stats = entry->second;
 		if (!column_stats || !StringStats::HasMinMax(*column_stats)) {
 			return false;
 		}
@@ -269,9 +273,9 @@ private:
 	MinMaxColumnInfo column_info;
 	unique_ptr<ValueComparator> comparator;
 	StorageIndex storage_index;
-	//! Statistics of this client's BOUND partitions, in classification order
-	mutable vector<pair<const FoldPartition *, unique_ptr<BaseStatistics>>> bound_stats;
-	mutable idx_t bound_stats_idx = 0;
+	//! Statistics of this client's BOUND VARCHAR partitions, keyed by partition identity, so the
+	//! exclusion looks them up by partition and never depends on a voting order
+	mutable unordered_map<const FoldPartition *, unique_ptr<BaseStatistics>> bound_stats;
 };
 
 //! COUNT(*) over the partition statistics: the partition counts must be exact and are summed.
