@@ -55,6 +55,10 @@ public:
 	static unique_ptr<BaseStatistics> PropagateMonotoneBounds(ClientContext &context,
 	                                                          const BoundFunctionExpression &func,
 	                                                          const vector<BaseStatistics> &child_stats);
+	//! Evaluate `func` at plan time with every argument replaced by the given constant. Returns false
+	//! when the function cannot be evaluated at those arguments.
+	static bool TryEvaluateAtConstants(ClientContext &context, const BoundFunctionExpression &func,
+	                                   const vector<Value> &arg_values, Value &result);
 	//! Compare two sets of statistics and return whether the comparison is always true or false
 	static FilterPropagateResult PropagateComparison(const BaseStatistics &left, const BaseStatistics &right,
 	                                                 ExpressionType comparison);

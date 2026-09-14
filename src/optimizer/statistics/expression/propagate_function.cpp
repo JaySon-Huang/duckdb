@@ -10,9 +10,8 @@
 
 namespace duckdb {
 
-namespace {
-bool TryEvaluateAtConstants(ClientContext &context, const BoundFunctionExpression &func,
-                            const vector<Value> &arg_values, Value &result) {
+bool StatisticsPropagator::TryEvaluateAtConstants(ClientContext &context, const BoundFunctionExpression &func,
+                                                  const vector<Value> &arg_values, Value &result) {
 	vector<unique_ptr<Expression>> children;
 	children.reserve(arg_values.size());
 	for (auto &v : arg_values) {
@@ -23,6 +22,8 @@ bool TryEvaluateAtConstants(ClientContext &context, const BoundFunctionExpressio
 	clone->Cast<BoundFunctionExpression>().GetChildrenMutable() = std::move(children);
 	return ExpressionExecutor::TryEvaluateScalar(context, *clone, result);
 }
+
+namespace {
 
 // Equal bounds need not imply identical inputs for certain types, so we skip this optimization for those values.
 // Floating-point bounds only lose information for the sign of zero.
