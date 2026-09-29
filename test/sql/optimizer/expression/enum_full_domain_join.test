@@ -189,3 +189,59 @@ query I
 SELECT count(*) FROM guard_check;
 ----
 3
+
+# 14. compound constant_or_null inputs are not folded: the nullability proof only covers bare
+#     column references, so the expression survives and is pushed down as a scan filter
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(TRUE, a_nn.k + 1);
+----
+physical_plan	<REGEX>:.*constant_or_null\(true, \(k \+ 1\)\).*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(TRUE, a_nn.k + 1);
+----
+48
+
+# 15. inputs referencing both join sides are not folded (no single child can prove them)
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(TRUE, a_nn.k + b.k);
+----
+physical_plan	<REGEX>:.*constant_or_null\(true, \(k \+ k\)\).*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(TRUE, a_nn.k + b.k);
+----
+48
+
+# 16. folding inside an ANY-join condition (OR): the folded disjunct collapses the whole
+#     condition to always-true and the join becomes a cross product
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy') OR a_nn.k = b.k;
+----
+physical_plan	<REGEX>:.*CROSS_PRODUCT.*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy') OR a_nn.k = b.k;
+----
+144
+
+# 17. ASOF join: the folded IN conjunct is erased from the conditions, the ASOF inequality stays
+statement ok
+CREATE TABLE a_t AS SELECT (range % 3)::INTEGER AS k, ['sad', 'ok', 'happy'][1 + range % 3]::mood AS m, range::INTEGER AS t FROM range(12);
+
+statement ok
+CREATE TABLE b_t AS SELECT (range % 3)::INTEGER AS k, range::INTEGER AS t FROM range(12);
+
+query II
+explain
+SELECT count(*) FROM a_t ASOF JOIN b_t ON a_t.k = b_t.k AND a_t.t >= b_t.t AND a_t.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*Conditions: k = k, t <= t.*
+
+query I
+SELECT count(*) FROM a_t ASOF JOIN b_t ON a_t.k = b_t.k AND a_t.t >= b_t.t AND a_t.m IN ('sad', 'ok', 'happy');
+----
+12
