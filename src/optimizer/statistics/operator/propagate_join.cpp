@@ -85,6 +85,9 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 		auto &condition = join.conditions[i];
 		if (!condition.IsComparison()) {
 			PropagateExpression(condition.JoinExpressionReference());
+			// Shape-based classification: statistics-provable truth of arbitrary expressions
+			// is not consulted here. Pushdown moves single-side INNER join conditions into
+			// child filters; non-pushable conditions (e.g. mixed both-side) still reach it
 			switch (ClassifyFilter(*condition.JoinExpressionReference())) {
 			case FilterPropagateResult::FILTER_ALWAYS_FALSE:
 			case FilterPropagateResult::FILTER_FALSE_OR_NULL:

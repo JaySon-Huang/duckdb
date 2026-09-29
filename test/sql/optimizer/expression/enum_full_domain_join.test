@@ -245,3 +245,17 @@ query I
 SELECT count(*) FROM a_t ASOF JOIN b_t ON a_t.k = b_t.k AND a_t.t >= b_t.t AND a_t.m IN ('sad', 'ok', 'happy');
 ----
 12
+
+# 18. INNER joins reach the never-matches classification too: pushdown moves single-side
+#     conditions into child filters, but a non-pushable mixed-side condition rides into the
+#     join re-created by join ordering and empties it
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(FALSE, a_nn.k + b.k);
+----
+physical_plan	<REGEX>:.*EMPTY.*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND constant_or_null(FALSE, a_nn.k + b.k);
+----
+0
