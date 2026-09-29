@@ -128,7 +128,6 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 
 	vector<unique_ptr<Expression>> children;
 	children.reserve(func_children.size());
-	children.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(!value.value())));
 	for (idx_t child_idx = 1; child_idx < func_children.size(); ++child_idx) {
 		children.push_back(std::move(func_children[child_idx]));
 	}
@@ -187,6 +186,33 @@ unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeInternal(uniqu
 
 	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
 		return OptimizeFilter(std::move(op), plan_has_side_effects);
+	}
+
+	switch (op->type) {
+	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
+		auto &any_join = op->Cast<LogicalAnyJoin>();
+		NotNullExpressionAnalyzer analyzer(context);
+		any_join.condition = SimplifyExpression(*op, std::move(any_join.condition), analyzer, false);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		NotNullExpressionAnalyzer analyzer(context);
+		for (auto &cond : join.conditions) {
+			if (cond.IsComparison()) {
+				cond.LeftReference() = SimplifyExpression(*op, std::move(cond.LeftReference()), analyzer, false);
+				cond.RightReference() = SimplifyExpression(*op, std::move(cond.RightReference()), analyzer, false);
+			} else {
+				cond.JoinExpressionReference() =
+				    SimplifyExpression(*op, std::move(cond.JoinExpressionReference()), analyzer, false);
+			}
+		}
+		break;
+	}
+	default:
+		break;
 	}
 
 	return op;

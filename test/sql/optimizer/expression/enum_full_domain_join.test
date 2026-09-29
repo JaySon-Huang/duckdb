@@ -44,13 +44,13 @@ SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
 48
 
 # 3. LEFT join, preserved-side ON predicate: the predicate cannot be pushed into a filter,
-#    so it stays in the join condition. The IN rewrite fires there, but the NOT is NOT
-#    pushed into constant_or_null (that pass only visits filters)
+#    so it stays in the join condition. The IN rewrite fires there and NOT is pushed into
+#    constant_or_null: NOT constant_or_null(true, m) becomes constant_or_null(false, m)
 query II
 explain
 SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
 ----
-physical_plan	<REGEX>:.*NOT constant_or_null\(true, m\).*
+physical_plan	<REGEX>:.*Conditions:.*k = k,.*constant_or_null\(false, m\).*
 
 query I
 SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
@@ -81,7 +81,7 @@ query II
 explain
 SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
 ----
-physical_plan	<REGEX>:.*NOT constant_or_null\(true, m\).*
+physical_plan	<REGEX>:.*Conditions:.*k = k,.*constant_or_null\(false, m\).*
 
 query I
 SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
