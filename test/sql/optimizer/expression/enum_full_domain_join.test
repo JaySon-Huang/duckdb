@@ -1,0 +1,89 @@
+# name: test/sql/optimizer/expression/enum_full_domain_join.test
+# description: Full-domain ENUM (NOT) IN rewritten inside join conditions, and NOT-pushdown scope for constant_or_null
+# group: [expression]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TYPE mood AS ENUM('sad', 'ok', 'happy');
+
+# nullable column with all domain values plus one NULL row
+statement ok
+CREATE TABLE a AS SELECT (range % 3)::INTEGER AS k, ['sad', 'ok', 'happy'][1 + range % 3]::mood AS m FROM range(12);
+
+statement ok
+CREATE TABLE b AS SELECT (range % 3)::INTEGER AS k, range::INTEGER AS v FROM range(12);
+
+statement ok
+INSERT INTO a VALUES (99, NULL);
+
+# 1. INNER join: the single-side ON predicate is pushed into a filter on a, where the
+#    NOT-IN over the full domain collapses to an empty result
+query II
+explain
+SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*EMPTY.*
+
+query I
+SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+0
+
+# 2. INNER join with IN over the full domain: pushed down as an IS NOT NULL filter
+query II
+explain
+SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*m IS NOT NULL.*
+
+query I
+SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
+----
+48
+
+# 3. LEFT join, preserved-side ON predicate: the predicate cannot be pushed into a filter,
+#    so it stays in the join condition. The IN rewrite fires there, but the NOT is NOT
+#    pushed into constant_or_null (that pass only visits filters)
+query II
+explain
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*NOT constant_or_null\(true, m\).*
+
+query I
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+13
+
+# the condition is never true, so no row of b ever matches: b.v is always NULL
+query I
+SELECT count(b.v) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+0
+
+# 4. LEFT join, preserved-side IN over the full domain: constant_or_null stays in the join
+#    condition (matches on non-NULL m; the NULL row survives unmatched)
+query II
+explain
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null\(true, m\).*
+
+query I
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
+----
+49
+
+# 5. RIGHT join with the predicate on the preserved side behaves like case 3
+query II
+explain
+SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*NOT constant_or_null\(true, m\).*
+
+query I
+SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+13
