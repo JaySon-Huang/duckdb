@@ -2,6 +2,7 @@
 
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/optimizer/expression_rewriter.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -112,6 +113,53 @@ static unique_ptr<Expression> ApplyNotPushdown(ClientContext &context, unique_pt
 	return ExpressionRewriter::ConstantOrNull(context, std::move(children), Value::BOOLEAN(!value.value()));
 }
 
+//! Whether every NULL-sensitive input of the constant_or_null is provably NOT NULL on the output
+//! of the join child that binds it. Join conditions are evaluated per pair of child rows (before
+//! any NULL extension), so the proof must be taken from the owning child, not from the join output.
+static bool JoinConditionInputsAreNotNull(LogicalOperator &join_op, BoundFunctionExpression &func,
+                                          NotNullExpressionAnalyzer &analyzer) {
+	auto &children = func.GetChildren();
+	for (idx_t child_idx = 1; child_idx < children.size(); ++child_idx) {
+		auto &input = *children[child_idx];
+		if (input.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			auto &constant = input.Cast<BoundConstantExpression>().GetValue();
+			if (!constant.IsNull()) {
+				continue;
+			}
+		}
+		// Only bare column references can be proven non-NULL
+		if (input.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &colref = input.Cast<BoundColumnRefExpression>();
+		if (colref.Depth() != 0) {
+			return false;
+		}
+		// Locate the join child that binds the column; bail on mixed-side inputs
+		optional_idx side;
+		for (idx_t side_idx = 0; side_idx < join_op.children.size(); side_idx++) {
+			for (auto &binding : join_op.children[side_idx]->GetColumnBindings()) {
+				if (binding.table_index != colref.Binding().table_index) {
+					continue;
+				}
+				if (!side.IsValid()) {
+					side = side_idx;
+				} else if (side.GetIndex() != side_idx) {
+					return false;
+				}
+				break;
+			}
+		}
+		if (!side.IsValid()) {
+			return false;
+		}
+		if (!analyzer.IsNotNull(*join_op.children[side.GetIndex()], input)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalOperator &input,
                                                                         unique_ptr<Expression> expr,
                                                                         NotNullExpressionAnalyzer &analyzer,
@@ -140,9 +188,31 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 	return ApplyNotPushdown(context, std::move(expr));
 }
 
-unique_ptr<Expression> ConstantOrNullSimplification::SimplifyJoinCondition(unique_ptr<Expression> expr) {
-	ExpressionIterator::EnumerateChildren(
-	    *expr, [&](unique_ptr<Expression> &child) { child = SimplifyJoinCondition(std::move(child)); });
+unique_ptr<Expression> ConstantOrNullSimplification::SimplifyJoinCondition(LogicalOperator &join_op,
+                                                                           NotNullExpressionAnalyzer &analyzer,
+                                                                           unique_ptr<Expression> expr,
+                                                                           bool allow_folding) {
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+		child = SimplifyJoinCondition(join_op, analyzer, std::move(child), allow_folding);
+	});
+
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		if (!allow_folding) {
+			return expr;
+		}
+		auto value = GetConstantOrNullBoolean(*expr);
+		if (!value.has_value()) {
+			return expr;
+		}
+
+		auto &func = expr->Cast<BoundFunctionExpression>();
+		if (!ConstantOrNullInputsAreVolatile(func) && JoinConditionInputsAreNotNull(join_op, func, analyzer)) {
+			return make_uniq<BoundConstantExpression>(Value::BOOLEAN(value.value()));
+		}
+
+		return expr;
+	}
+
 	return ApplyNotPushdown(context, std::move(expr));
 }
 
@@ -200,19 +270,25 @@ unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeInternal(uniqu
 		return OptimizeFilter(std::move(op), plan_has_side_effects);
 	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
 		auto &any_join = op->Cast<LogicalAnyJoin>();
-		any_join.condition = SimplifyJoinCondition(std::move(any_join.condition));
+		NotNullExpressionAnalyzer analyzer(context);
+		any_join.condition = SimplifyJoinCondition(*op, analyzer, std::move(any_join.condition), !plan_has_side_effects);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
 		auto &join = op->Cast<LogicalComparisonJoin>();
+		NotNullExpressionAnalyzer analyzer(context);
+		const bool allow_folding = !plan_has_side_effects;
 		for (auto &cond : join.conditions) {
 			if (cond.IsComparison()) {
-				cond.LeftReference() = SimplifyJoinCondition(std::move(cond.LeftReference()));
-				cond.RightReference() = SimplifyJoinCondition(std::move(cond.RightReference()));
+				cond.LeftReference() =
+				    SimplifyJoinCondition(*op, analyzer, std::move(cond.LeftReference()), allow_folding);
+				cond.RightReference() =
+				    SimplifyJoinCondition(*op, analyzer, std::move(cond.RightReference()), allow_folding);
 			} else {
-				cond.JoinExpressionReference() = SimplifyJoinCondition(std::move(cond.JoinExpressionReference()));
+				cond.JoinExpressionReference() =
+				    SimplifyJoinCondition(*op, analyzer, std::move(cond.JoinExpressionReference()), allow_folding);
 			}
 		}
 		break;

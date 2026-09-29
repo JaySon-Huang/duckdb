@@ -85,12 +85,25 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 		auto &condition = join.conditions[i];
 		if (!condition.IsComparison()) {
 			PropagateExpression(condition.JoinExpressionReference());
-			// A condition that is FALSE or NULL (e.g. constant_or_null(false, e)) rejects
-			// every pair of rows - none of the other conditions matter
 			switch (ClassifyFilter(*condition.JoinExpressionReference())) {
 			case FilterPropagateResult::FILTER_ALWAYS_FALSE:
 			case FilterPropagateResult::FILTER_FALSE_OR_NULL:
+				// A condition that is FALSE or NULL (e.g. constant_or_null(false, e)) rejects
+				// every pair of rows - none of the other conditions matter
 				if (HandleJoinNeverMatches(join, node_ptr)) {
+					return;
+				}
+				break;
+			case FilterPropagateResult::FILTER_ALWAYS_TRUE:
+				// An always-true condition is a no-op for matching
+				if (join.conditions.size() > 1) {
+					join.conditions.erase_at(i);
+					i--;
+					removed_expressions = true;
+					continue;
+				}
+				if (HandleJoinAlwaysMatches(join, node_ptr)) {
+					removed_expressions = true;
 					return;
 				}
 				break;

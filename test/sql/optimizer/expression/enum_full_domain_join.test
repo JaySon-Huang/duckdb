@@ -159,3 +159,56 @@ query I
 SELECT count(*) FROM guard_check WHERE m IS NULL;
 ----
 1
+
+# 11. join-condition folding: with a provably non-NULL enum column, the full-domain IN folds
+#     to constant true and is erased, leaving a single equi-join condition (the multi-condition
+#     rendering would put "k = k," on its own line below "Conditions:")
+statement ok
+CREATE TABLE a_nn AS SELECT (range % 3)::INTEGER AS k, ['sad', 'ok', 'happy'][1 + range % 3]::mood AS m FROM range(12);
+
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*Conditions: k = k.*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
+----
+48
+
+# 12. a single always-true condition turns the INNER join into a cross product
+query II
+explain
+SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*CROSS_PRODUCT.*
+
+query I
+SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy');
+----
+144
+
+# 13. LEFT join with the folded condition: erased, and every row still matches
+query I
+SELECT count(*) FROM a_nn LEFT JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
+----
+48
+
+# 14. DML CTE plans do not fold join conditions (stale statistics could hide NULL rows) -
+#     the condition is evaluated per row and the INSERT still runs
+query II
+explain
+WITH ins AS (INSERT INTO guard_check VALUES (2, 'ok') RETURNING *) SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*constant_or_null\(true, m\).*
+
+query I
+WITH ins AS (INSERT INTO guard_check VALUES (2, 'ok') RETURNING *) SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
+----
+48
+
+query I
+SELECT count(*) FROM guard_check;
+----
+3
