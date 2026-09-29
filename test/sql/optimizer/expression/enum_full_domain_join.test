@@ -44,13 +44,13 @@ SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
 48
 
 # 3. LEFT join, preserved-side ON predicate: the predicate cannot be pushed into a filter,
-#    so it stays in the join condition. The IN rewrite fires there and NOT is pushed into
-#    constant_or_null: NOT constant_or_null(true, m) becomes constant_or_null(false, m)
+#    so it stays in the join condition. The IN rewrite fires there, NOT is pushed into
+#    constant_or_null, and the never-matching condition empties the right side of the join
 query II
 explain
 SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
 ----
-physical_plan	<REGEX>:.*Conditions:.*k = k,.*constant_or_null\(false, m\).*
+physical_plan	<REGEX>:.*HASH_JOIN.*Join Type: LEFT.*constant_or_null\(false, m\).*EMPTY_RESULT.*
 
 query I
 SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
@@ -64,7 +64,9 @@ SELECT count(b.v) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', '
 0
 
 # 4. LEFT join, preserved-side IN over the full domain: constant_or_null stays in the join
-#    condition (matches on non-NULL m; the NULL row survives unmatched)
+#    condition (matches on non-NULL m; the NULL row survives unmatched). The IN direction does
+#    not degenerate: constant_or_null(true, m) is TRUE-or-NULL, and a NULL condition still
+#    rejects a pair, so non-NULL rows can still match
 query II
 explain
 SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
@@ -88,44 +90,19 @@ SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'h
 ----
 13
 
-# 6. LEFT join degeneration: a condition that is FALSE-or-NULL (constant_or_null(false, m))
-#    can never match, so the right side is replaced by an empty result
-query II
-explain
-SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
-----
-physical_plan	<REGEX>:.*HASH_JOIN.*Join Type: LEFT.*constant_or_null\(false, m\).*EMPTY_RESULT.*
-
-query I
-SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
-----
-13
-
-query I
-SELECT count(b.v) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
-----
-0
-
-# the IN direction does not degenerate: constant_or_null(true, m) is TRUE-or-NULL, and a
-# NULL condition still rejects a pair, so non-NULL rows can still match
-query I
-SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
-----
-49
-
-# 7. semi join over a never-matching condition produces no rows
+# 6. semi join over a never-matching condition produces no rows
 query I
 SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.m NOT IN ('sad', 'ok', 'happy'));
 ----
 0
 
-# 8. anti join over a never-matching condition keeps every row
+# 7. anti join over a never-matching condition keeps every row
 query I
 SELECT count(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.m NOT IN ('sad', 'ok', 'happy'));
 ----
 13
 
-# 9. full outer join is not degenerated (both sides contribute rows even without matches)
+# 8. full outer join is not degenerated (both sides contribute rows even without matches)
 query II
 explain
 SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
@@ -137,7 +114,7 @@ SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok
 ----
 25
 
-# 10. DML CTE plans skip statistics propagation entirely, so the join is not degenerated -
+# 9. DML CTE plans skip statistics propagation entirely, so the join is not degenerated -
 #     the INSERT must still run exactly once
 statement ok
 CREATE TABLE guard_check(k INTEGER, m mood);
@@ -160,7 +137,7 @@ SELECT count(*) FROM guard_check WHERE m IS NULL;
 ----
 1
 
-# 11. join-condition folding: with a provably non-NULL enum column, the full-domain IN folds
+# 10. join-condition folding: with a provably non-NULL enum column, the full-domain IN folds
 #     to constant true and is erased, leaving a single equi-join condition (the multi-condition
 #     rendering would put "k = k," on its own line below "Conditions:")
 statement ok
@@ -177,7 +154,7 @@ SELECT count(*) FROM a_nn JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'ha
 ----
 48
 
-# 12. a single always-true condition turns the INNER join into a cross product
+# 11. a single always-true condition turns the INNER join into a cross product
 query II
 explain
 SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy');
@@ -189,13 +166,13 @@ SELECT count(*) FROM a_nn JOIN b ON a_nn.m IN ('sad', 'ok', 'happy');
 ----
 144
 
-# 13. LEFT join with the folded condition: erased, and every row still matches
+# 12. LEFT join with the folded condition: erased, and every row still matches
 query I
 SELECT count(*) FROM a_nn LEFT JOIN b ON a_nn.k = b.k AND a_nn.m IN ('sad', 'ok', 'happy');
 ----
 48
 
-# 14. DML CTE plans do not fold join conditions (stale statistics could hide NULL rows) -
+# 13. DML CTE plans do not fold join conditions (stale statistics could hide NULL rows) -
 #     the condition is evaluated per row and the INSERT still runs
 query II
 explain
