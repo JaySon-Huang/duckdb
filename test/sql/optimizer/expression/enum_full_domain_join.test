@@ -87,3 +87,75 @@ query I
 SELECT count(*) FROM b RIGHT JOIN a ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
 ----
 13
+
+# 6. LEFT join degeneration: a condition that is FALSE-or-NULL (constant_or_null(false, m))
+#    can never match, so the right side is replaced by an empty result
+query II
+explain
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*Join Type: LEFT.*constant_or_null\(false, m\).*EMPTY_RESULT.*
+
+query I
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+13
+
+query I
+SELECT count(b.v) FROM a LEFT JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+0
+
+# the IN direction does not degenerate: constant_or_null(true, m) is TRUE-or-NULL, and a
+# NULL condition still rejects a pair, so non-NULL rows can still match
+query I
+SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND a.m IN ('sad', 'ok', 'happy');
+----
+49
+
+# 7. semi join over a never-matching condition produces no rows
+query I
+SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.m NOT IN ('sad', 'ok', 'happy'));
+----
+0
+
+# 8. anti join over a never-matching condition keeps every row
+query I
+SELECT count(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND a.m NOT IN ('sad', 'ok', 'happy'));
+----
+13
+
+# 9. full outer join is not degenerated (both sides contribute rows even without matches)
+query II
+explain
+SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*
+
+query I
+SELECT count(*) FROM a FULL OUTER JOIN b ON a.k = b.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+25
+
+# 10. DML CTE plans skip statistics propagation entirely, so the join is not degenerated -
+#     the INSERT must still run exactly once
+statement ok
+CREATE TABLE guard_check(k INTEGER, m mood);
+
+statement ok
+INSERT INTO guard_check VALUES (1, 'sad');
+
+query I
+WITH ins AS (INSERT INTO guard_check VALUES (99, NULL) RETURNING *) SELECT count(*) FROM a LEFT JOIN ins ON a.k = ins.k AND a.m NOT IN ('sad', 'ok', 'happy');
+----
+13
+
+query I
+SELECT count(*) FROM guard_check;
+----
+2
+
+query I
+SELECT count(*) FROM guard_check WHERE m IS NULL;
+----
+1
