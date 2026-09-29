@@ -79,6 +79,39 @@ static bool ConstantOrNullInputsAreVolatile(BoundFunctionExpression &func) {
 	return false;
 }
 
+//! Push NOT into a constant_or_null (or into a plain constant) on a single expression node.
+//! Pure rewrite that keeps per-row NULL checks - also valid for side-effecting plans.
+static unique_ptr<Expression> ApplyNotPushdown(ClientContext &context, unique_ptr<Expression> expr) {
+	if (expr->GetExpressionType() != ExpressionType::OPERATOR_NOT) {
+		return expr;
+	}
+
+	auto &not_expr = expr->Cast<BoundOperatorExpression>();
+	D_ASSERT(not_expr.GetChildren().size() == 1);
+
+	auto value = GetBooleanConstant(*not_expr.GetChildren()[0]);
+	if (value.has_value()) {
+		return make_uniq<BoundConstantExpression>(Value::BOOLEAN(!value.value()));
+	}
+
+	value = GetConstantOrNullBoolean(*not_expr.GetChildren()[0]);
+	if (!value.has_value()) {
+		return expr;
+	}
+
+	auto &func = not_expr.GetChildren()[0]->Cast<BoundFunctionExpression>();
+	auto &func_children = func.GetChildrenMutable();
+	D_ASSERT(func_children.size() >= 2);
+
+	vector<unique_ptr<Expression>> children;
+	children.reserve(func_children.size());
+	for (idx_t child_idx = 1; child_idx < func_children.size(); ++child_idx) {
+		children.push_back(std::move(func_children[child_idx]));
+	}
+
+	return ExpressionRewriter::ConstantOrNull(context, std::move(children), Value::BOOLEAN(!value.value()));
+}
+
 unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalOperator &input,
                                                                         unique_ptr<Expression> expr,
                                                                         NotNullExpressionAnalyzer &analyzer,
@@ -104,35 +137,13 @@ unique_ptr<Expression> ConstantOrNullSimplification::SimplifyExpression(LogicalO
 		return expr;
 	}
 
-	if (expr->GetExpressionType() != ExpressionType::OPERATOR_NOT) {
-		return expr;
-	}
+	return ApplyNotPushdown(context, std::move(expr));
+}
 
-	// Push NOT into constant_or_null without dropping per-row NULL checks.
-	auto &not_expr = expr->Cast<BoundOperatorExpression>();
-	D_ASSERT(not_expr.GetChildren().size() == 1);
-
-	auto value = GetBooleanConstant(*not_expr.GetChildren()[0]);
-	if (value.has_value()) {
-		return make_uniq<BoundConstantExpression>(Value::BOOLEAN(!value.value()));
-	}
-
-	value = GetConstantOrNullBoolean(*not_expr.GetChildren()[0]);
-	if (!value.has_value()) {
-		return expr;
-	}
-
-	auto &func = not_expr.GetChildren()[0]->Cast<BoundFunctionExpression>();
-	auto &func_children = func.GetChildrenMutable();
-	D_ASSERT(func_children.size() >= 2);
-
-	vector<unique_ptr<Expression>> children;
-	children.reserve(func_children.size());
-	for (idx_t child_idx = 1; child_idx < func_children.size(); ++child_idx) {
-		children.push_back(std::move(func_children[child_idx]));
-	}
-
-	return ExpressionRewriter::ConstantOrNull(this->context, std::move(children), Value::BOOLEAN(!value.value()));
+unique_ptr<Expression> ConstantOrNullSimplification::SimplifyJoinCondition(unique_ptr<Expression> expr) {
+	ExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<Expression> &child) { child = SimplifyJoinCondition(std::move(child)); });
+	return ApplyNotPushdown(context, std::move(expr));
 }
 
 unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeFilter(unique_ptr<LogicalOperator> op,
@@ -184,29 +195,24 @@ unique_ptr<LogicalOperator> ConstantOrNullSimplification::OptimizeInternal(uniqu
 		child = OptimizeInternal(std::move(child), plan_has_side_effects);
 	}
 
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-		return OptimizeFilter(std::move(op), plan_has_side_effects);
-	}
-
 	switch (op->type) {
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return OptimizeFilter(std::move(op), plan_has_side_effects);
 	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
 		auto &any_join = op->Cast<LogicalAnyJoin>();
-		NotNullExpressionAnalyzer analyzer(context);
-		any_join.condition = SimplifyExpression(*op, std::move(any_join.condition), analyzer, false);
+		any_join.condition = SimplifyJoinCondition(std::move(any_join.condition));
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
 		auto &join = op->Cast<LogicalComparisonJoin>();
-		NotNullExpressionAnalyzer analyzer(context);
 		for (auto &cond : join.conditions) {
 			if (cond.IsComparison()) {
-				cond.LeftReference() = SimplifyExpression(*op, std::move(cond.LeftReference()), analyzer, false);
-				cond.RightReference() = SimplifyExpression(*op, std::move(cond.RightReference()), analyzer, false);
+				cond.LeftReference() = SimplifyJoinCondition(std::move(cond.LeftReference()));
+				cond.RightReference() = SimplifyJoinCondition(std::move(cond.RightReference()));
 			} else {
-				cond.JoinExpressionReference() =
-				    SimplifyExpression(*op, std::move(cond.JoinExpressionReference()), analyzer, false);
+				cond.JoinExpressionReference() = SimplifyJoinCondition(std::move(cond.JoinExpressionReference()));
 			}
 		}
 		break;
