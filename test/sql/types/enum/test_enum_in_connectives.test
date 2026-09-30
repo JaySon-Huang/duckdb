@@ -127,3 +127,44 @@ query I
 SELECT j FROM t2 WHERE j > 0 ORDER BY j
 ----
 1
+
+# the rewritten OR pushes a multi-column filter into the scan: row groups where m is all-NULL
+# and y excludes the constant are pruned entirely
+statement ok
+ATTACH '{TEST_DIR}/enum_in_or_prune.duckdb' AS prune_db (ROW_GROUP_SIZE 2048);
+
+statement ok
+USE prune_db;
+
+statement ok
+CREATE TYPE mood AS ENUM ('happy', 'sad', 'meh');
+
+# first row group: m all non-NULL, y in [0, 2047]; second: m all NULL, y in [102048, 104095]
+statement ok
+CREATE TABLE pg AS SELECT CASE WHEN range < 2048 THEN 'happy'::mood END AS m,
+    CASE WHEN range < 2048 THEN range ELSE 100000 + range END AS y FROM range(4096);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM pg WHERE (m IN ('happy', 'sad', 'meh')) OR y = 5;
+----
+analyzed_plan	<REGEX>:.*Row Groups Scanned: 1 / 2.*
+
+query I
+SELECT count(*) FROM pg WHERE (m IN ('happy', 'sad', 'meh')) OR y = 5
+----
+2048
+
+# row groups with mixed NULLs in m are not pruned: the OR is not classifiable there
+statement ok
+CREATE TABLE mixed AS SELECT CASE WHEN range % 2 = 0 THEN 'happy'::mood END AS m,
+    CASE WHEN range < 2048 THEN range ELSE 100000 + range END AS y FROM range(4096);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM mixed WHERE (m IN ('happy', 'sad', 'meh')) OR y = 5;
+----
+analyzed_plan	<REGEX>:.*Row Groups Scanned: 2 / 2.*
+
+query I
+SELECT count(*) FROM mixed WHERE (m IN ('happy', 'sad', 'meh')) OR y = 5
+----
+2049

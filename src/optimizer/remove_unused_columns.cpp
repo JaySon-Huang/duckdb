@@ -1343,20 +1343,9 @@ void RemoveUnusedColumns::RemoveColumnsFromLogicalGet(LogicalGet &get, unique_pt
 		//! Now visit the filter to add to the 'column_references'
 		VisitExpression(&filter_expression);
 	}
-	//! The 'column_references' hold references to these expressions, so they have to stay alive
-	vector<unique_ptr<Expression>> multi_filter_columns;
-	for (const auto &filter : get.table_filters.GetMultiColumnFilters()) {
-		const auto &expression_filter = ExpressionFilter::GetExpressionFilter(*filter, "RemoveUnusedColumns::VisitGet");
-		for (const auto &filter_idx : expression_filter.column_indexes) {
-			const auto &col_id = get.GetColumnIndex(filter_idx);
-			auto column_type = get.GetColumnType(col_id);
-			ColumnBinding filter_binding(get.table_index, filter_idx);
-			multi_filter_columns.push_back(make_uniq<BoundColumnRefExpression>(std::move(column_type), filter_binding));
-		}
-	}
-	for (auto &column_ref : multi_filter_columns) {
-		VisitExpression(&column_ref);
-	}
+	//! Multi-column filters are only used for row group pruning on DuckDB scans: they never read column values, so
+	//! their columns are not pinned here. When a column they reference is pruned, the filter is dropped during the
+	//! remap below
 
 	//! Check with the LogicalGet whether pushdown-extract is supported
 	CheckPushdownExtract(get);
@@ -1442,14 +1431,19 @@ void RemoveUnusedColumns::RemoveColumnsFromLogicalGet(LogicalGet &get, unique_pt
 			auto remapped_filter =
 			    ExpressionFilter::GetExpressionFilter(*filter, "RemoveUnusedColumns::RemoveColumnsFromLogicalGet")
 			        .Copy();
+			bool filter_alive = true;
 			for (auto &column_index : remapped_filter->column_indexes) {
 				auto it = old_to_new_pos.find(column_index);
 				if (it == old_to_new_pos.end()) {
-					throw InternalException("RemoveUnusedColumns: removed a multi-column filter column");
+					// the filter's column is no longer read: the filter cannot be evaluated and is dropped
+					filter_alive = false;
+					break;
 				}
 				column_index = it->second;
 			}
-			remapped_filters.PushMultiColumnFilter(std::move(remapped_filter));
+			if (filter_alive) {
+				remapped_filters.PushMultiColumnFilter(std::move(remapped_filter));
+			}
 		}
 		get.table_filters = std::move(remapped_filters);
 	}

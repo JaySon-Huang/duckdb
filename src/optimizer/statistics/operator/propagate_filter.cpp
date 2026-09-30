@@ -302,9 +302,12 @@ FilterPropagateResult StatisticsPropagator::HandleFilter(unique_ptr<Expression> 
 	PropagateExpression(condition);
 	if (mode == StatisticsPropagationMode::FILTER_SIMPLIFICATION) {
 		SimplifyFilter(condition);
-		filter_bindings_changed |= original_bindings != GetFilterBindings(*condition);
 	}
-	SimplifyConstantOrNullConnectives(condition);
+	const bool connectives_changed = SimplifyConstantOrNullConnectives(condition);
+	if (mode == StatisticsPropagationMode::FILTER_SIMPLIFICATION) {
+		// a reshaped condition (e.g. an OR with a rewritten NULL check) may now be pushable into the scan
+		filter_bindings_changed |= original_bindings != GetFilterBindings(*condition) || connectives_changed;
+	}
 	auto prune_result = ClassifyFilter(*condition);
 	if (prune_result == FilterPropagateResult::NO_PRUNING_POSSIBLE) {
 		// cannot prune this filter: propagate statistics from the filter

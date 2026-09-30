@@ -409,6 +409,15 @@ static bool CanDeriveExpressionStatistics(const Expression &expr) {
 }
 
 static bool CanPropagateExpressionStatisticsInternal(const Expression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		// IS [NOT] NULL over a statistics-derivable child: the child stats determine the result
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		if (op.GetExpressionType() != ExpressionType::OPERATOR_IS_NULL &&
+		    op.GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL) {
+			return false;
+		}
+		return op.GetChildren().size() == 1 && CanDeriveExpressionStatistics(*op.GetChildren()[0]);
+	}
 	if (BoundComparisonExpression::IsComparison(expr)) {
 		switch (expr.GetExpressionType()) {
 		case ExpressionType::COMPARE_EQUAL:
