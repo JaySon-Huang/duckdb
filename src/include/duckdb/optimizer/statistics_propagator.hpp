@@ -99,6 +99,10 @@ private:
 	FilterPropagateResult ClassifyFilter(Expression &condition);
 	//! Simplify conjunctions using filter truth semantics
 	bool SimplifyFilter(unique_ptr<Expression> &condition);
+	//! Rewrite constant_or_null atoms inside AND/OR (positive, NOT-free context) into NULL checks; returns true if the
+	//! expression was changed. Only descends through AND/OR: the rewrite is a filter equivalence, not an expression
+	//! identity, and is unsound under NOT or when the value is observed
+	bool SimplifyConstantOrNullConnectives(unique_ptr<Expression> &expr);
 	//! Propagate a filter condition
 	FilterPropagateResult HandleFilter(unique_ptr<Expression> &condition);
 	//! Rewrite a join whose condition can never match; returns true if the operator was replaced

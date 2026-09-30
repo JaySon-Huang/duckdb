@@ -304,6 +304,7 @@ FilterPropagateResult StatisticsPropagator::HandleFilter(unique_ptr<Expression> 
 		SimplifyFilter(condition);
 		filter_bindings_changed |= original_bindings != GetFilterBindings(*condition);
 	}
+	SimplifyConstantOrNullConnectives(condition);
 	auto prune_result = ClassifyFilter(*condition);
 	if (prune_result == FilterPropagateResult::NO_PRUNING_POSSIBLE) {
 		// cannot prune this filter: propagate statistics from the filter

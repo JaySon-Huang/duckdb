@@ -1,0 +1,129 @@
+# name: test/sql/types/enum/test_enum_in_connectives.test
+# description: Full-domain ENUM IN rewrites inside AND/OR connectives (positive context only)
+# group: [enum]
+
+statement ok
+CREATE TYPE mood AS ENUM ('happy', 'sad', 'meh');
+
+statement ok
+CREATE TABLE t (i INTEGER, m mood);
+
+statement ok
+INSERT INTO t VALUES (1, 'happy'), (2, 'sad'), (3, 'meh'), (4, NULL);
+
+# full-domain IN as a disjunct behaves like IS NOT NULL: NULL rows fail the atom, pass on the other disjunct
+query I
+SELECT i FROM t WHERE m IN ('happy', 'sad', 'meh') OR i = 4 ORDER BY i
+----
+1
+2
+3
+4
+
+query I
+SELECT i FROM t WHERE m IN ('happy', 'sad', 'meh') OR i = 2 ORDER BY i
+----
+1
+2
+3
+
+# a NULL in the list does not change the full-domain rewrite
+query I
+SELECT i FROM t WHERE m IN ('happy', 'sad', 'meh', NULL) OR i = 4 ORDER BY i
+----
+1
+2
+3
+4
+
+# parity with the explicit IS NOT NULL formulation
+query I
+SELECT i FROM t WHERE m IS NOT NULL OR i = 4 ORDER BY i
+----
+1
+2
+3
+4
+
+# enum::VARCHAR probe variant
+query I
+SELECT i FROM t WHERE m::VARCHAR IN ('happy', 'sad', 'meh') OR i = 4 ORDER BY i
+----
+1
+2
+3
+4
+
+# full-domain NOT IN can never be TRUE: the disjunct is dropped, only the other disjunct decides
+query I
+SELECT i FROM t WHERE m NOT IN ('happy', 'sad', 'meh') OR i = 4 ORDER BY i
+----
+4
+
+query I
+SELECT i FROM t WHERE m NOT IN ('happy', 'sad', 'meh', NULL) OR i = 4 ORDER BY i
+----
+4
+
+query I
+SELECT i FROM t WHERE m NOT IN ('happy', 'sad', 'meh') OR i = 99
+----
+
+# full-domain NOT IN as a conjunct can never pass: empty result
+query I
+SELECT i FROM t WHERE m NOT IN ('happy', 'sad', 'meh') AND i = 4
+----
+
+# partial-domain IN is not rewritten: NULL row must fail the atom
+query I
+SELECT i FROM t WHERE m IN ('happy', 'sad') OR i = 4 ORDER BY i
+----
+1
+2
+4
+
+# the rewrite must not happen under NOT: row 4 has m IS NULL, where the atom is NULL and NOT(NULL) is NULL
+query I
+SELECT i FROM t WHERE NOT (m IN ('happy', 'sad', 'meh') OR i = 99)
+----
+
+query I
+SELECT i FROM t WHERE NOT (m NOT IN ('happy', 'sad', 'meh') OR i = 99)
+----
+1
+2
+3
+
+# AND nested under OR is still a positive context
+query I
+SELECT i FROM t WHERE (m IN ('happy', 'sad', 'meh') AND i = 1) OR i = 4 ORDER BY i
+----
+1
+4
+
+# the atom keeps three-valued semantics when observed as a value (CASE): NULL, not FALSE
+query II
+SELECT i, CASE WHEN i = 4 THEN m IN ('happy', 'sad', 'meh') ELSE false END AS c FROM t ORDER BY i
+----
+1	false
+2	false
+3	false
+4	NULL
+
+# statistics-derived constant_or_null atoms (comparison proven true-or-null) are rewritten too
+statement ok
+CREATE TABLE t2 (j INTEGER);
+
+statement ok
+INSERT INTO t2 VALUES (1), (NULL);
+
+query I
+SELECT j FROM t2 WHERE j > 0 OR j IS NULL ORDER BY j
+----
+1
+NULL
+
+query I
+SELECT j FROM t2 WHERE j > 0 ORDER BY j
+----
+1
